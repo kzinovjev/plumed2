@@ -1,0 +1,4 @@
+name: asm
+authors: Kirill Zinovjev
+description: An implementation of adaptive string method (ASM)
+dois: ["10.1021/acs.jpca.7b10842"]
