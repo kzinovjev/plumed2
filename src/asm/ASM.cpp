@@ -129,6 +129,10 @@ public:
 
   unsigned getNumberOfDerivatives() override { return getNumberOfArguments(); }
   bool actionHasForces() override { return false; }
+  // Tells PlumedMain::prepareDependencies to call setOption("GRADIENTS"),
+  // which propagates to upstream actions (TORSION etc.) so their Value::gradients
+  // map gets populated from the per-atom derivatives we read in buildLocalMetric.
+  bool checkNeedsGradients() const override { return !read_M_; }
   void calculateNumericalDerivatives(ActionWithValue* a = nullptr) override {
     plumed_merror("ASM does not support numerical derivatives");
   }
@@ -145,11 +149,38 @@ private:
   void setOutputForce(unsigned i, double f) { outputForces_[i] = f; }
   void setBias(double e) { val_bias_->set(e); }
 
+  // metric helpers
   void cacheMasses();
   void buildLocalMetric(std::vector<double>& Mout);
   void packToMatrix(const std::vector<double>& packed, Matrix<double>& M) const;
   void matrixToPacked(const Matrix<double>& M, std::vector<double>& packed) const;
   void invertPacked(const std::vector<double>& packed, std::vector<double>& inv_packed) const;
+
+  // packed-symmetric matrix-vector product:  out = M_packed · v
+  void matVecPacked(const std::vector<double>& Mpacked,
+                    const std::vector<double>& v,
+                    std::vector<double>&       out) const;
+  // metric-weighted dot:  a^T M_packed b
+  double dotProductM(const std::vector<double>& a,
+                     const std::vector<double>& b,
+                     const std::vector<double>& Mpacked) const;
+  // metric-weighted norm:  sqrt(v^T M_packed v)
+  double lenM(const std::vector<double>& v,
+              const std::vector<double>& Mpacked) const;
+  // periodic-aware difference  (string_node_i - cv_i)
+  void cvDiff(unsigned i, std::vector<double>& dCV) const;
+
+  // multi-replica state synchronisation
+  void gatherStringAcrossReplicas();
+  void gatherKlAcrossReplicas();
+
+  // string-method helpers
+  void initStringFromCurrentCV();
+  void buildArcLengths();           // sets pos_ from |string[i+1]-string[i]|_Minv
+  void computeTangentsFD();         // tangent at each node from finite differences
+  void normaliseTangentLocal();     // n_vec_[node_] /= ||n_vec_[node_]||_Minv
+  void updateBLocal();              // B[node_] from K_l, K_d, n_vec, Minv
+  void reparametrizeLinear();       // gather + arclength + tangent + updateB
 };
 
 PLUMED_REGISTER_ACTION(ASM, "ASM")
@@ -168,55 +199,55 @@ void ASM::registerKeywords(Keywords& keys) {
   keys.add("hidden", "STRIDE",
            "internal use; ASM forces stride to 1");
 
-  // I/O
-  keys.add("compulsory", "dir", "results",
+  // I/O. Keyword spellings match sander's namelist variables; PLUMED's
+  // input parser is case-insensitive but stores keys uppercase.
+  keys.add("compulsory", "DIR", "results",
            "output directory for {node}.dat, {step}.string, parameter logs");
-  keys.add("compulsory", "output_period", "100",
+  keys.add("compulsory", "OUTPUT_PERIOD", "100",
            "stride (in MD steps) for writing snapshots and parameter logs");
-  keys.add("compulsory", "checkpoint_file", "asm_state.ckpt",
+  keys.add("compulsory", "CHECKPOINT_FILE", "asm_state.ckpt",
            "checkpoint file name (auto-suffixed with replica index when nnodes>1)");
-  keys.add("optional", "checkpoint_period",
-           "stride for checkpoint writes (default = output_period)");
+  keys.add("optional", "CHECKPOINT_PERIOD",
+           "stride for checkpoint writes (default = OUTPUT_PERIOD)");
 
   // Stage timing
-  keys.add("compulsory", "preparation_steps", "1000",
+  keys.add("compulsory", "PREPARATION_STEPS", "1000",
            "steps over which the harmonic force ramps from 0 to 1");
-  keys.add("optional", "start_step",
-           "step at which string evolution begins (default = preparation_steps)");
-  keys.add("compulsory", "string_move_period", "1",
+  keys.add("optional", "START_STEP",
+           "step at which string evolution begins (default = PREPARATION_STEPS)");
+  keys.add("compulsory", "STRING_MOVE_PERIOD", "1",
            "apply accumulated dz/dpos/dK every N steps");
 
   // Force constants
-  keys.add("optional", "force_constant_l",
+  keys.add("optional", "FORCE_CONSTANT_L",
            "longitudinal harmonic spring constant (default auto-tuned)");
-  keys.add("optional", "force_constant_d",
-           "orthogonal harmonic spring constant (default = force_constant_l/2)");
+  keys.add("optional", "FORCE_CONSTANT_D",
+           "orthogonal harmonic spring constant (default = FORCE_CONSTANT_L/2)");
 
   // Frictions / dynamics
-  keys.add("compulsory", "gamma",          "2000",   "string friction (ps^-1)");
-  keys.add("compulsory", "position_gamma", "200000", "node-position friction (ps^-1)");
-  keys.add("compulsory", "force_gamma",    "5",      "K-adaptation friction");
-  keys.add("compulsory", "force_kappa",    "1000",   "K-adaptation drift term");
-  keys.add("compulsory", "Mav_damp",       "1e-3",   "EMA damping for metric tensor");
+  keys.add("compulsory", "GAMMA",          "2000",   "string friction (ps^-1)");
+  keys.add("compulsory", "POSITION_GAMMA", "200000", "node-position friction (ps^-1)");
+  keys.add("compulsory", "FORCE_GAMMA",    "5",      "K-adaptation friction");
+  keys.add("compulsory", "FORCE_KAPPA",    "1000",   "K-adaptation drift term");
+  keys.add("compulsory", "MAV_DAMP",       "1e-3",   "EMA damping for metric tensor");
 
   // Replica exchange
-  keys.add("compulsory", "REX_period",     "0",
+  keys.add("compulsory", "REX_PERIOD",     "0",
            "attempt internal bias-exchange replica exchange every N steps; 0 disables");
 
-  // Flags. Sander uses YES/NO namelist values; we mirror that with
-  // compulsory string keywords rather than PLUMED's addFlag (which forces
-  // default=false). Parse handled by yesno() in the constructor.
-  keys.add("compulsory", "string_move",    "YES",
+  // Flags. Sander uses YES/NO namelist values; mirrored as string-valued
+  // keywords (PLUMED's addFlag requires default=false).
+  keys.add("compulsory", "STRING_MOVE",    "YES",
            "if NO, K and string never change (passive bias)");
-  keys.add("compulsory", "fix_ends",       "YES",
+  keys.add("compulsory", "FIX_ENDS",       "YES",
            "pin the two terminal nodes during string evolution");
-  keys.add("compulsory", "read_M",         "NO",
+  keys.add("compulsory", "READ_M",         "NO",
            "use a fixed Minv from the initial guess; skip metric averaging");
-  keys.add("compulsory", "rescale_forces", "YES",
+  keys.add("compulsory", "RESCALE_FORCES", "YES",
            "rescale K with string length on each reparametrization");
 
   // Initial guess
-  keys.add("optional", "guess_file",
+  keys.add("optional", "GUESS_FILE",
            "initial-guess file (sander format); empty means use the current ARG values");
 
   // Output components
@@ -258,8 +289,13 @@ ASM::ASM(const ActionOptions& ao):
   msize_ = ncv_*(ncv_+1)/2;
 
   // Atomic gradients on each ARG are required to assemble the metric.
+  // turnOnDerivatives() populates Value::data with atom derivatives;
+  // setOption("GRADIENTS") triggers ActionWithValue::setGradientsIfNeeded()
+  // to convert that into the Value::gradients map we read in buildLocalMetric.
   for(unsigned i=0; i<ncv_; ++i) {
-    getPntrToArgument(i)->getPntrToAction()->turnOnDerivatives();
+    ActionWithValue* upstream = getPntrToArgument(i)->getPntrToAction();
+    upstream->turnOnDerivatives();
+    upstream->setOption("GRADIENTS");
   }
 
   // ---- atoms -----------------------------------------------------------
@@ -273,34 +309,34 @@ ASM::ASM(const ActionOptions& ao):
   requestAtoms(atoms, false);
 
   // ---- output dir / files --------------------------------------------
-  parse("dir", dir_);
+  parse("DIR", dir_);
   if(!dir_.empty() && dir_.back() != '/') dir_ += '/';
 
-  parse("output_period", output_period_);
-  parse("checkpoint_file", ckpt_filename_);
+  parse("OUTPUT_PERIOD", output_period_);
+  parse("CHECKPOINT_FILE", ckpt_filename_);
   checkpoint_period_ = 0;          // sentinel for "not given"
-  parse("checkpoint_period", checkpoint_period_);
+  parse("CHECKPOINT_PERIOD", checkpoint_period_);
   if(checkpoint_period_ == 0) checkpoint_period_ = output_period_;
   if(nnodes_ > 1) {
     ckpt_filename_ += "." + std::to_string(node_);
   }
 
   // ---- stage timing ----------------------------------------------------
-  parse("preparation_steps", preparation_steps_);
+  parse("PREPARATION_STEPS", preparation_steps_);
   long start_step_in = -1;
-  parse("start_step", start_step_in);
+  parse("START_STEP", start_step_in);
   start_step_ = (start_step_in >= 0) ? start_step_in : long(preparation_steps_);
-  parse("string_move_period", string_move_period_);
+  parse("STRING_MOVE_PERIOD", string_move_period_);
 
   // ---- frictions / dynamics -------------------------------------------
-  parse("gamma",          gamma_);
-  parse("position_gamma", position_gamma_);
-  parse("force_gamma",    force_gamma_);
-  parse("force_kappa",    force_kappa_);
-  parse("Mav_damp",       Mav_damp_);
+  parse("GAMMA",          gamma_);
+  parse("POSITION_GAMMA", position_gamma_);
+  parse("FORCE_GAMMA",    force_gamma_);
+  parse("FORCE_KAPPA",    force_kappa_);
+  parse("MAV_DAMP",       Mav_damp_);
 
   // ---- replica exchange ----------------------------------------------
-  parse("REX_period", REX_period_);
+  parse("REX_PERIOD", REX_period_);
 
   // ---- flags (parsed as YES/NO strings) ------------------------------
   auto parseYesNo = [&](const char* key, bool& dst) {
@@ -309,15 +345,15 @@ ASM::ASM(const ActionOptions& ao):
     else if(s == "NO" || s == "no" || s == "No" || s == "false" || s == "FALSE" || s == "0") dst = false;
     else error(std::string("unrecognised YES/NO value for ") + key + ": '" + s + "'");
   };
-  parseYesNo("string_move",    string_move_);
-  parseYesNo("fix_ends",       fix_ends_);
-  parseYesNo("read_M",         read_M_);
-  parseYesNo("rescale_forces", rescale_forces_);
+  parseYesNo("STRING_MOVE",    string_move_);
+  parseYesNo("FIX_ENDS",       fix_ends_);
+  parseYesNo("READ_M",         read_M_);
+  parseYesNo("RESCALE_FORCES", rescale_forces_);
 
   // ---- force constants (defer auto-default until first calculate) -----
   double K_l_in = -1.0, K_d_in = -1.0;
-  parse("force_constant_l", K_l_in);
-  parse("force_constant_d", K_d_in);
+  parse("FORCE_CONSTANT_L", K_l_in);
+  parse("FORCE_CONSTANT_D", K_d_in);
 
   // ---- output components ----------------------------------------------
   addComponent("bias");   componentIsNotPeriodic("bias");
@@ -354,10 +390,9 @@ ASM::ASM(const ActionOptions& ao):
     RT_ = 2.5;
   }
 
-  // Initial-guess file (parsing only; reading happens after the first
-  // gatherStringAcrossReplicas in the next implementation step).
+  // Initial-guess file (parsing only; file reader not implemented yet).
   std::string guess_file;
-  parse("guess_file", guess_file);
+  parse("GUESS_FILE", guess_file);
 
   checkRead();
 
@@ -450,17 +485,278 @@ void ASM::buildLocalMetric(std::vector<double>& Mout) {
   }
 }
 
+void ASM::matVecPacked(const std::vector<double>& Mpacked,
+                       const std::vector<double>& v,
+                       std::vector<double>&       out) const {
+  out.assign(ncv_, 0.0);
+  unsigned p = 0;
+  for(unsigned i=0; i<ncv_; ++i) {
+    for(unsigned j=0; j<=i; ++j) {
+      out[i] += Mpacked[p] * v[j];
+      if(j != i) out[j] += Mpacked[p] * v[i];
+      ++p;
+    }
+  }
+}
+double ASM::dotProductM(const std::vector<double>& a,
+                        const std::vector<double>& b,
+                        const std::vector<double>& Mpacked) const {
+  std::vector<double> Mb;
+  matVecPacked(Mpacked, b, Mb);
+  double s = 0.0;
+  for(unsigned i=0; i<ncv_; ++i) s += a[i]*Mb[i];
+  return s;
+}
+double ASM::lenM(const std::vector<double>& v,
+                 const std::vector<double>& Mpacked) const {
+  const double s = dotProductM(v, v, Mpacked);
+  return s > 0.0 ? std::sqrt(s) : 0.0;
+}
+
+void ASM::cvDiff(unsigned i, std::vector<double>& dCV) const {
+  // Periodic-aware (CV - string[node_]) — sander's map_periodic(CVs - string).
+  dCV.resize(ncv_);
+  for(unsigned k=0; k<ncv_; ++k) {
+    dCV[k] = getPntrToArgument(k)->difference(string_[i][k], getArgument(k));
+  }
+}
+
+void ASM::gatherStringAcrossReplicas() {
+  // Allgather string_[node_], pos_[node_], Mav_[node_] so every replica holds
+  // a complete picture. Done on rank-0-of-comm and Bcast within comm so that
+  // every MD rank within a replica observes the same state.
+  std::vector<double> sendS(ncv_), sendM(msize_);
+  for(unsigned k=0; k<ncv_; ++k) sendS[k] = string_[node_][k];
+  for(unsigned k=0; k<msize_; ++k) sendM[k] = Mav_[node_][k];
+  const double sendP = pos_[node_];
+  const double sendK = K_l_[node_];
+
+  std::vector<double> recvS(ncv_*nnodes_, 0.0);
+  std::vector<double> recvM(msize_*nnodes_, 0.0);
+  std::vector<double> recvP(nnodes_, 0.0);
+  std::vector<double> recvK(nnodes_, 0.0);
+
+  if(comm.Get_rank() == 0) {
+    plumed.multi_sim_comm.Allgather(sendS, recvS);
+    plumed.multi_sim_comm.Allgather(sendM, recvM);
+    plumed.multi_sim_comm.Allgather(&sendP, 1, recvP.data(), 1);
+    plumed.multi_sim_comm.Allgather(&sendK, 1, recvK.data(), 1);
+  }
+  comm.Bcast(recvS, 0);
+  comm.Bcast(recvM, 0);
+  comm.Bcast(recvP, 0);
+  comm.Bcast(recvK, 0);
+
+  for(unsigned i=0; i<nnodes_; ++i) {
+    for(unsigned k=0; k<ncv_; ++k) string_[i][k] = recvS[i*ncv_ + k];
+    for(unsigned k=0; k<msize_; ++k) Mav_[i][k] = recvM[i*msize_ + k];
+    pos_[i] = recvP[i];
+    K_l_[i] = recvK[i];
+    invertPacked(Mav_[i], Minv_[i]);
+  }
+}
+
+void ASM::gatherKlAcrossReplicas() {
+  std::vector<double> recv(nnodes_, 0.0);
+  const double sendK = K_l_[node_];
+  if(comm.Get_rank() == 0) {
+    plumed.multi_sim_comm.Allgather(&sendK, 1, recv.data(), 1);
+  }
+  comm.Bcast(recv, 0);
+  for(unsigned i=0; i<nnodes_; ++i) K_l_[i] = recv[i];
+}
+
+void ASM::initStringFromCurrentCV() {
+  // Default initial-guess path: every replica's current ARG values are taken
+  // as that node's string position. After Allgather every replica sees the
+  // full polyline.
+  for(unsigned k=0; k<ncv_; ++k) string_[node_][k] = getArgument(k);
+}
+
+void ASM::buildArcLengths() {
+  // Cumulative metric-weighted arc length along the (continuous-on-PBC)
+  // string. pos_[0] = 0 ; pos_[i] = pos_[i-1] + ||string_[i]-string_[i-1]||_M
+  // using the average of the two adjacent Minv-tensors (same convention as
+  // sander's reparameterize_linear, asm.F90:1218-1222).
+  pos_[0] = 0.0;
+  std::vector<double> dx(ncv_), Mavg(msize_);
+  for(unsigned i=1; i<nnodes_; ++i) {
+    for(unsigned k=0; k<ncv_; ++k) {
+      dx[k] = getPntrToArgument(k)->difference(string_[i-1][k], string_[i][k]);
+    }
+    for(unsigned k=0; k<msize_; ++k) Mavg[k] = 0.5*(Minv_[i-1][k] + Minv_[i][k]);
+    pos_[i] = pos_[i-1] + lenM(dx, Mavg);
+  }
+  string_length_ = pos_[nnodes_-1];
+}
+
+void ASM::computeTangentsFD() {
+  // Centred finite-difference tangent at each interior node; one-sided at
+  // the ends. Pre-spline approximation; replaced by spline derivative once
+  // reparametrizeLinear's spline branch is wired up.
+  std::vector<double> dx(ncv_);
+  for(unsigned i=0; i<nnodes_; ++i) {
+    const unsigned a = (i == 0) ? 0 : i-1;
+    const unsigned b = (i+1 == nnodes_) ? nnodes_-1 : i+1;
+    for(unsigned k=0; k<ncv_; ++k) {
+      dx[k] = getPntrToArgument(k)->difference(string_[a][k], string_[b][k]);
+    }
+    n_vec_[i] = dx;
+  }
+}
+
+void ASM::normaliseTangentLocal() {
+  // sander normalize_M: n -> Minv·n / sqrt(n^T Minv Minv·n)? Actually sander
+  // computes n -> n / ||n||_Minv where ||v||_Minv^2 = v^T Minv v.
+  const double L = lenM(n_vec_[node_], Minv_[node_]);
+  if(L > 0.0) {
+    for(unsigned k=0; k<ncv_; ++k) n_vec_[node_][k] /= L;
+  }
+}
+
+void ASM::updateBLocal() {
+  // sander update_B (asm.F90:974-994):
+  //   Minvn = Minv · n
+  //   S_ij  = Minvn_i * Minvn_j      (outer product)
+  //   B = S*(K_l - K_d) + Minv*K_d
+  std::vector<double> Minvn;
+  matVecPacked(Minv_[node_], n_vec_[node_], Minvn);
+
+  std::vector<double>& Bn = B_[node_];
+  Bn.assign(msize_, 0.0);
+  unsigned p = 0;
+  const double dk = K_l_[node_] - K_d_;
+  for(unsigned i=0; i<ncv_; ++i) {
+    for(unsigned j=0; j<=i; ++j) {
+      Bn[p] = Minvn[i]*Minvn[j]*dk + Minv_[node_][p]*K_d_;
+      ++p;
+    }
+  }
+}
+
+void ASM::reparametrizeLinear() {
+  // First-pass implementation: sync state across replicas, recompute arc
+  // lengths and string_length_, refresh per-node tangents (finite-diff for
+  // now — spline tangent + node redistribution come with the next commit),
+  // then rebuild B for this replica.
+  gatherStringAcrossReplicas();
+  buildArcLengths();
+  computeTangentsFD();
+  normaliseTangentLocal();
+  updateBLocal();
+}
+
 void ASM::calculate() {
-  // Placeholder: zero-force, zero-bias. Real per-step physics arrives in the
-  // next commit.
-  for(unsigned i=0; i<ncv_; ++i) setOutputForce(i, 0.0);
-  setBias(0.0);
-  val_force2_->set(0.0);
+  if(first_calculate_) {
+    cacheMasses();
+
+    // 1. Initial metric sample. (sander asm.F90:301-303.)
+    if(!read_M_) {
+      buildLocalMetric(Mav_[node_]);
+      invertPacked(Mav_[node_], Minv_[node_]);
+    }
+
+    // 2. Initial string positions: current ARG values at each replica.
+    //    (read_initial_guess deferred until we wire up file parsing.)
+    initStringFromCurrentCV();
+
+    // 3. Sync, build arclengths + tangents + B.
+    reparametrizeLinear();
+
+    // 4. Default K_l auto-tuning if user did not supply force_constant_l.
+    if(K_l_local_ <= 0.0) {
+      const double delta = string_length_ / double(nnodes_-1);
+      K_l_local_ = RT_ / (0.25 * delta * delta);
+      for(auto& k : K_l_) k = K_l_local_;
+    }
+    if(K_d_ <= 0.0) {
+      K_d_ = 0.5 * K_l_local_;
+    }
+    updateBLocal();
+
+    first_calculate_ = false;
+  }
+
+  const long local_step = getStep() + step0_;
+
+  // 1. Local metric sample (this step) — sander asm.F90:541.
+  std::vector<double> M_now;
+  if(string_move_ && !read_M_) buildLocalMetric(M_now);
+
+  // 2. Apply harmonic force on the input ARGs.  sander add_force_ld:
+  //      F_i = -force_scale * (B[node_] · diff(CV - string[node_]))_i
+  //      energy = 0.5 * force_scale * diff^T B diff
+  std::vector<double> dCV;
+  cvDiff(node_, dCV);
+  std::vector<double> B_dCV;
+  matVecPacked(B_[node_], dCV, B_dCV);
+  double ene = 0.0, totf2 = 0.0;
+  for(unsigned k=0; k<ncv_; ++k) {
+    const double f = -force_scale_ * B_dCV[k];
+    setOutputForce(k, f);
+    ene += 0.5 * dCV[k] * B_dCV[k];
+    totf2 += f*f;
+  }
+  setBias(force_scale_ * ene);
+  val_force2_->set(totf2);
+
+  // 3. EMA-update Mav and refresh Minv.   sander asm.F90:541-545.
+  if(string_move_ && !read_M_) {
+    auto& Mav = Mav_[node_];
+    for(unsigned k=0; k<msize_; ++k)
+      Mav[k] = (1.0 - Mav_damp_)*Mav[k] + Mav_damp_*M_now[k];
+    invertPacked(Mav, Minv_[node_]);
+    normaliseTangentLocal();
+  }
+
+  // 4. Force-ramp / production accumulators.
+  if(local_step < start_step_) {
+    force_scale_ = std::min(1.0, double(local_step) / double(preparation_steps_));
+    return;     // no accumulation during preparation
+  }
+  force_scale_ = 1.0;
+
+  // dz_tmp: orthogonal displacement, sander asm.F90:557-559.
+  //   tangent dot:   t = dCV · (Minv · n_vec)  using current Minv
+  //   dz_tmp_i = K_d * (dCV_i - n_vec_i * t)
+  std::vector<double> Minvn;
+  matVecPacked(Minv_[node_], n_vec_[node_], Minvn);
+  double tdot = 0.0;
+  for(unsigned k=0; k<ncv_; ++k) tdot += dCV[k] * Minvn[k];
+  std::vector<double> dz_tmp(ncv_, 0.0);
+  for(unsigned k=0; k<ncv_; ++k) dz_tmp[k] = K_d_ * (dCV[k] - n_vec_[node_][k]*tdot);
+
+  // dpos_tmp / sigma2 EMA / dK_tmp — sander asm.F90:563-583.
+  const double delta = string_length_ / double(nnodes_-1);
+  const double pos_target = delta*double(node_) - pos_[node_];
+  const double sigma2_target = 0.25 * delta * delta;
+  double dpos_tmp = pos_target - tdot;
+
+  // First production step: seed the EMAs (sander asm.F90:567).
+  if(local_step == start_step_) {
+    std::fill(dz_.begin(), dz_.end(), 0.0);
+    dpos_ = dK_ = 0.0;
+    mean_dx_     = 0.0;
+    mean_sigma2_ = dpos_tmp * dpos_tmp;
+  }
+  mean_dx_     = 0.99*mean_dx_     + 0.01*dpos_tmp;
+  mean_sigma2_ = 0.99*mean_sigma2_ + 0.01*dpos_tmp*dpos_tmp;
+  double dK_tmp = 0.0;
+  if(local_step >= start_step_ + 100 && mean_sigma2_ > 0.0) {
+    dK_tmp = RT_/sigma2_target - RT_/mean_sigma2_
+           + force_kappa_ * mean_dx_ * mean_dx_;
+  }
+  dpos_tmp *= K_l_[node_];
+
+  if(string_move_) {
+    for(unsigned k=0; k<ncv_; ++k) dz_[k] += dz_tmp[k];
+    dpos_ += dpos_tmp;
+    dK_   += dK_tmp;
+  }
 }
 
 void ASM::update() {
-  // Placeholder: no I/O, no string evolution. Real per-stride logic arrives
-  // in subsequent commits.
+  // String-evolution + reparametrization + outputs land in the next commit.
 }
 
 void ASM::apply() {
