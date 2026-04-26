@@ -1332,9 +1332,10 @@ void ASM::calculate() {
     // 3.5  Output files (per-replica .dat opens here, after dir_ is known).
     if(!outputs_opened_) { openOutputFiles(); outputs_opened_ = true; }
     if(is_server_) {
-      writeSnapshot(0);
+      const long lstep0 = getStep() + step0_;
+      writeSnapshot(lstep0);
       writeParams();
-      snapshot_steps_.push_back(0);
+      snapshot_steps_.push_back(lstep0);
     }
 
     // 4. Default K_l auto-tuning if user did not supply force_constant_l.

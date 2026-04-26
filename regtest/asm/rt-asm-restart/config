@@ -1,0 +1,19 @@
+type=driver
+plumed_modules=asm
+mpiprocs=2
+arg="--multi 2 --plumed plumed.dat --ixyz trajectory.xyz --mc mc.dat"
+extra_files="../../trajectories/trajectory.xyz"
+
+# Phase 1: run a "baseline" job that writes a checkpoint at the end. The
+# main test (phase 2) then resumes from that checkpoint via the RESTART
+# directive in plumed.dat. Outputs from phase 1 are kept aside and
+# discarded so the regtest framework only diffs the phase-2 outputs.
+function plumed_regtest_before() {
+  $mpi $valgrind $plumed driver --multi 2 --plumed plumed_phase1.dat \
+    --ixyz trajectory.xyz --mc mc.dat > phase1_out 2> phase1_err
+  # Move/remove phase-1 outputs that would otherwise collide with phase 2.
+  for f in colvar.0 colvar.1 0.dat 1.dat 0.string 2.string 4.string \
+           node_positions.dat force_constants.dat convergence.dat; do
+    rm -f "$f"
+  done
+}
