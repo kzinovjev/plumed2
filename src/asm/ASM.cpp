@@ -197,8 +197,14 @@ private:
   void writeParams() const;         // node_positions.dat, force_constants.dat
   void writeConvergence() const;    // convergence.dat — full history of snapshot distances
 
+  // checkpoint / restart
+  std::string ckptPath() const;
+  void writeCheckpoint(long local_step) const;
+  void readCheckpoint();            // called from constructor when RESTART YES
+
   // first-call guard for one-time work in reparametrizeLinear
   bool first_reparametrize_ = true;
+  bool restarted_           = false;  // set by readCheckpoint(); skips cold-start init
   std::vector<double> L_;            // arc lengths to each node (rebuilt every reparam)
 };
 
@@ -434,8 +440,7 @@ ASM::ASM(const ActionOptions& ao):
              read_M_         ? "YES":"NO",
              rescale_forces_ ? "YES":"NO");
   if(getRestart()) {
-    log.printf("    RESTART requested — will read %s on first calculate()\n",
-               ckpt_filename_.c_str());
+    readCheckpoint();
   }
   if(!guess_file.empty()) {
     log.printf("    initial guess: %s (reader not implemented yet — placeholder)\n",
@@ -761,6 +766,117 @@ void ASM::writeConvergence() const {
   }
 }
 
+// ----- checkpoint / restart ----------------------------------------------
+
+std::string ASM::ckptPath() const {
+  std::string p = ckpt_filename_;
+  if(!p.empty() && p[0] != '/') p = dir_ + p;
+  return p;
+}
+
+void ASM::writeCheckpoint(long local_step) const {
+  // One file per replica, atomic-rename. Stores the *minimum* state needed
+  // to resume: derived quantities (Minv, B, n_vec, spline) are recomputed
+  // on restart by gather + reparametrize.
+  if(ckpt_filename_.empty()) return;
+  const std::string final_path = ckptPath();
+  const std::string tmp_path   = final_path + ".tmp";
+  std::ofstream out(tmp_path);
+  if(!out) {
+    log.printf("WARNING: ASM cannot open checkpoint %s\n", tmp_path.c_str());
+    return;
+  }
+  out.setf(std::ios::scientific);
+  out.precision(15);
+  out << "# ASM checkpoint v1\n";
+  out << "version 1\n";
+  out << "local_step "   << local_step << '\n';
+  out << "nnodes "       << nnodes_    << '\n';
+  out << "ncv "          << ncv_       << '\n';
+  out << "node "         << node_      << '\n';
+  out << "K_l_local "    << K_l_local_ << '\n';
+  out << "pos "          << pos_[node_] << '\n';
+  out << "string";
+  for(unsigned k=0; k<ncv_; ++k) out << ' ' << string_[node_][k];
+  out << '\n';
+  out << "Mav";
+  for(unsigned k=0; k<msize_; ++k) out << ' ' << Mav_[node_][k];
+  out << '\n';
+  out << "dz";
+  for(unsigned k=0; k<ncv_; ++k) out << ' ' << dz_[k];
+  out << '\n';
+  out << "dpos "         << dpos_         << '\n';
+  out << "dK "           << dK_           << '\n';
+  out << "mean_dx "      << mean_dx_      << '\n';
+  out << "mean_sigma2 "  << mean_sigma2_  << '\n';
+  out.close();
+  std::error_code ec;
+  std::filesystem::rename(tmp_path, final_path, ec);
+  if(ec) {
+    log.printf("WARNING: ASM cannot rename %s -> %s: %s\n",
+               tmp_path.c_str(), final_path.c_str(), ec.message().c_str());
+  }
+}
+
+void ASM::readCheckpoint() {
+  // Read the minimum saved state into per-replica slots; the full set of
+  // arrays (other nodes' string/Mav/...) is filled by the cold-start
+  // gather chain that runs on first calculate().
+  const std::string fname = ckptPath();
+  std::ifstream in(fname);
+  if(!in) {
+    log.printf("WARNING: ASM RESTART requested but %s not found; starting cold\n",
+               fname.c_str());
+    return;
+  }
+  // Defensive: pre-allocate dz_ since it's read into a vector member.
+  if(dz_.size() != ncv_) dz_.assign(ncv_, 0.0);
+  if(string_[node_].size() != ncv_) string_[node_].assign(ncv_, 0.0);
+  if(Mav_[node_].size() != msize_)  Mav_[node_]   .assign(msize_, 0.0);
+
+  std::string tag;
+  long saved_local_step = 0;
+  unsigned ck_nnodes = 0, ck_ncv = 0, ck_node = 0, version = 0;
+  while(in >> tag) {
+    if(tag.size() && tag[0] == '#') {        // skip comment lines
+      std::string rest; std::getline(in, rest);
+      continue;
+    }
+    if      (tag == "version")     in >> version;
+    else if (tag == "local_step")  in >> saved_local_step;
+    else if (tag == "nnodes")      in >> ck_nnodes;
+    else if (tag == "ncv")         in >> ck_ncv;
+    else if (tag == "node")        in >> ck_node;
+    else if (tag == "K_l_local")   in >> K_l_local_;
+    else if (tag == "pos")         in >> pos_[node_];
+    else if (tag == "string")      for(unsigned k=0; k<ncv_; ++k)   in >> string_[node_][k];
+    else if (tag == "Mav")         for(unsigned k=0; k<msize_; ++k) in >> Mav_[node_][k];
+    else if (tag == "dz")          for(unsigned k=0; k<ncv_; ++k)   in >> dz_[k];
+    else if (tag == "dpos")        in >> dpos_;
+    else if (tag == "dK")          in >> dK_;
+    else if (tag == "mean_dx")     in >> mean_dx_;
+    else if (tag == "mean_sigma2") in >> mean_sigma2_;
+    else { std::string rest; std::getline(in, rest); }   // unknown tag: skip line
+  }
+  if(version != 1) {
+    error("ASM checkpoint " + fname + " has unsupported version "
+          + std::to_string(version));
+  }
+  if(ck_nnodes != nnodes_ || ck_ncv != ncv_ || ck_node != node_) {
+    error("ASM checkpoint topology mismatch: file says nnodes="
+          + std::to_string(ck_nnodes) + " ncv=" + std::to_string(ck_ncv)
+          + " node=" + std::to_string(ck_node) + ", expected "
+          + std::to_string(nnodes_) + "/" + std::to_string(ncv_) + "/"
+          + std::to_string(node_));
+  }
+  K_l_[node_] = K_l_local_;
+  step0_ = saved_local_step;        // local_step = getStep() + step0_ resumes
+  first_reparametrize_ = false;     // skip the equal-spacing pos initialiser
+  restarted_ = true;                // skip cold-start metric/string init in calculate()
+  log.printf("  ASM RESTART: resumed at local_step=%ld from %s\n",
+             saved_local_step, fname.c_str());
+}
+
 double ASM::scaleDpos(double x) const {
   // Exponential damping that prevents node-position inversions: the move
   // is throttled as |x| approaches the gap to the relevant neighbour.
@@ -914,6 +1030,12 @@ void ASM::update() {
       writeConvergence();
     }
   }
+
+  // --- per-checkpoint_period state dump (every replica) ---
+  if(local_step > 0 && long(checkpoint_period_) > 0
+     && local_step % long(checkpoint_period_) == 0) {
+    writeCheckpoint(local_step);
+  }
 }
 
 void ASM::calculate() {
@@ -921,14 +1043,17 @@ void ASM::calculate() {
     cacheMasses();
 
     // 1. Initial metric sample. (sander asm.F90:301-303.)
-    if(!read_M_) {
+    //    On restart we already have a saved Mav from the checkpoint and
+    //    must not overwrite it with a one-step sample.
+    if(!read_M_ && !restarted_) {
       buildLocalMetric(Mav_[node_]);
-      invertPacked(Mav_[node_], Minv_[node_]);
     }
+    invertPacked(Mav_[node_], Minv_[node_]);
 
     // 2. Initial string positions: current ARG values at each replica.
     //    (read_initial_guess deferred until we wire up file parsing.)
-    initStringFromCurrentCV();
+    //    On restart, string_[node_] was loaded from the checkpoint.
+    if(!restarted_) initStringFromCurrentCV();
 
     // 3. Sync, build arclengths + tangents + B.
     reparametrizeLinear();
