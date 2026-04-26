@@ -283,6 +283,10 @@ void ASM::registerKeywords(Keywords& keys) {
   keys.add("optional", "GUESS_FILE",
            "initial-guess file (sander format); empty means use the current ARG values");
 
+  // Temperature (read by getkBT(); not needed if MD code passes kBT)
+  keys.add("optional", "TEMP",
+           "the system temperature; only needed if the MD code does not pass kBT to PLUMED");
+
   // Output components
   keys.addOutputComponent("bias",   "default", "scalar", "instantaneous value of the bias potential");
   keys.addOutputComponent("force2", "default", "scalar", "instantaneous value of the squared bias force");
@@ -973,9 +977,10 @@ void ASM::attemptReplicaExchange(long local_step) {
   comm.Bcast(accept, 0);
 
   // ---- Apply accepted swaps -------------------------------------------
-  bool i_swapped = false;
+  bool any_swap = false;
   for(unsigned i=0; i+1<nnodes_; ++i) {
     if(!accept[i]) continue;
+    any_swap = true;
     // Determine if THIS rank is the lower or upper partner of (i, i+1).
     // "This rank" comparison goes via plumed.multi_sim_comm's rank since
     // node_to_rank_[i] was filled from that side of the gather.
@@ -990,7 +995,6 @@ void ASM::attemptReplicaExchange(long local_step) {
       mean_dx_      = mdx_by_node[i+1];
       mean_sigma2_  = ms2_by_node[i+1];
       node_         = i+1;
-      i_swapped = true;
     } else if(i_am_upper) {
       for(unsigned k=0; k<ncv_; ++k) dz_[k] = dz_by_node[i][k];
       dpos_         = dpos_by_node[i];
@@ -998,20 +1002,19 @@ void ASM::attemptReplicaExchange(long local_step) {
       mean_dx_      = mdx_by_node[i];
       mean_sigma2_  = ms2_by_node[i];
       node_         = i;
-      i_swapped = true;
     }
 
     // Update the global mapping the same way on every rank.
     std::swap(node_to_rank_[i], node_to_rank_[i+1]);
   }
 
-  if(i_swapped) {
+  // Refresh B_/n_vec_/Minv_ for the new node_ on every rank, even those
+  // that weren't part of a swap, because reparametrizeLinear is a collective
+  // (Allgather) call — partial participation would hang MPI. Skip entirely
+  // if no swap happened anywhere.
+  if(any_swap) {
     is_terminal_ = (node_ == 0 || node_+1 == nnodes_);
     is_server_   = (node_ == 0);
-    // After a swap, B_[new node_], n_vec_[new node_], Minv_[new node_] are
-    // someone else's stale cached state. The next reparametrize_linear call
-    // (which runs every string_move_period) refreshes them; force one now
-    // so the next calculate sees a consistent bias.
     reparametrizeLinear();
   }
 }
