@@ -36,6 +36,9 @@
 
 #include <array>
 #include <cmath>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -105,12 +108,11 @@ private:
   // -------- I/O ---------------------------------------------------------
   std::string dir_;
   std::string ckpt_filename_;
-  OFile ckpt_file_;
-  OFile dat_file_;
-  OFile npos_file_;
-  OFile fk_file_;
-  OFile conv_file_;
+  std::ofstream dat_stream_;          // {node_}.dat — per-step append
+  std::vector<long> snapshot_steps_;  // history for convergence.dat
   bool  first_calculate_ = true;
+  bool  outputs_opened_  = false;
+  std::vector<double> dz_tmp_last_;   // last per-step dz (for write_dat)
 
   // -------- output components -------------------------------------------
   Value* val_bias_   = nullptr;
@@ -186,6 +188,14 @@ private:
   void fitStringSpline();           // smoothing cubic spline over arc-length
   void splineTangentLocal();        // n_vec_[node_] from spline derivative at pos_[node_]
   double scaleDpos(double x) const; // sander scale_dpos: damping near the neighbour gap
+
+  // output writers (sander asm.F90:641-968)
+  void mkOutputDir() const;
+  void openOutputFiles();
+  void writeDat();                  // {node_}.dat — per-step append
+  void writeSnapshot(long step);    // {step}.string — every output_period
+  void writeParams() const;         // node_positions.dat, force_constants.dat
+  void writeConvergence() const;    // convergence.dat — full history of snapshot distances
 
   // first-call guard for one-time work in reparametrizeLinear
   bool first_reparametrize_ = true;
@@ -648,6 +658,109 @@ void ASM::splineTangentLocal() {
   for(unsigned k=0; k<ncv_; ++k) n_vec_[node_][k] = der[k];
 }
 
+// ----- output suite -------------------------------------------------------
+
+void ASM::mkOutputDir() const {
+  if(dir_.empty()) return;
+  std::error_code ec;
+  std::filesystem::create_directories(dir_, ec);    // no-op if it already exists
+  // Silently ignore failure: the open() calls below will surface the real error.
+}
+
+void ASM::openOutputFiles() {
+  mkOutputDir();
+  const std::string fname = dir_ + std::to_string(node_) + ".dat";
+  // Append mode so a restart continues an existing trajectory; sander's
+  // assign_dat_file uses access="append" (asm.F90:484).
+  dat_stream_.open(fname, std::ios::out | std::ios::app);
+  if(!dat_stream_) error("ASM: failed to open " + fname + " for output");
+  dat_stream_.setf(std::ios::scientific);
+  dat_stream_.precision(5);
+}
+
+void ASM::writeDat() {
+  // Per-step trajectory: CVs, this node's string position, dz_tmp/gamma.
+  // (sander write_dat at asm.F90:641-648.)
+  if(!dat_stream_) return;
+  auto fmt = [&](double v) { dat_stream_.width(15); dat_stream_ << v; };
+  for(unsigned k=0; k<ncv_; ++k) fmt(getArgument(k));
+  for(unsigned k=0; k<ncv_; ++k) fmt(string_[node_][k]);
+  for(unsigned k=0; k<ncv_; ++k) fmt(gamma_ > 0.0 ? dz_tmp_last_[k] / gamma_ : 0.0);
+  dat_stream_ << '\n';
+  dat_stream_.flush();
+}
+
+void ASM::writeSnapshot(long step) {
+  // {step}.string: all node coordinates in the spline-continuous form.
+  // Server-only. (sander write_string at asm.F90:847-901.)
+  toContinuousString();
+  const std::string fname = dir_ + std::to_string(step) + ".string";
+  std::ofstream out(fname);
+  if(!out) { log.printf("WARNING: ASM cannot open %s\n", fname.c_str()); return; }
+  out.setf(std::ios::scientific);
+  out.precision(5);
+  // Sander writes the 2-D string array column-major (CVs varying fastest);
+  // we mirror that one row per node so analysis tooling sees the same layout.
+  for(unsigned i=0; i<nnodes_; ++i) {
+    for(unsigned k=0; k<ncv_; ++k) { out.width(15); out << string_[i][k]; }
+    out << '\n';
+  }
+  // Re-wrap so subsequent local computation stays inside the canonical box.
+  for(unsigned k=0; k<ncv_; ++k) {
+    Value* v = getPntrToArgument(k);
+    if(v->isPeriodic())
+      for(unsigned i=0; i<nnodes_; ++i) string_[i][k] = v->bringBackInPbc(string_[i][k]);
+  }
+}
+
+void ASM::writeParams() const {
+  // node_positions.dat & force_constants.dat — appended every output_period.
+  // (sander write_params at asm.F90:907-921.)
+  const std::string n_fname = dir_ + "node_positions.dat";
+  const std::string k_fname = dir_ + "force_constants.dat";
+  std::ofstream nps(n_fname, std::ios::out | std::ios::app);
+  std::ofstream kps(k_fname, std::ios::out | std::ios::app);
+  if(!nps || !kps) return;
+  nps.setf(std::ios::fixed); nps.precision(5);
+  kps.setf(std::ios::fixed); kps.precision(5);
+  const double denom = (pos_[nnodes_-1] != 0.0) ? pos_[nnodes_-1] : 1.0;
+  for(unsigned i=0; i<nnodes_; ++i) { nps.width(15); nps << pos_[i] / denom; }
+  nps << '\n';
+  for(unsigned i=0; i<nnodes_; ++i) { kps.width(15); kps << K_l_[i]; }
+  kps << '\n';
+}
+
+void ASM::writeConvergence() const {
+  // For every previously-written snapshot, compute the metric-weighted
+  // average node-by-node distance from the current string and dump it.
+  // (sander write_convergence at asm.F90:927-968.)
+  const std::string fname = dir_ + "convergence.dat";
+  std::ofstream out(fname);
+  if(!out) return;
+  out.setf(std::ios::fixed); out.precision(5);
+  std::vector<std::vector<double>> tmp(nnodes_, std::vector<double>(ncv_));
+  for(long s : snapshot_steps_) {
+    const std::string sfname = dir_ + std::to_string(s) + ".string";
+    std::ifstream in(sfname);
+    if(!in) continue;
+    bool ok = true;
+    for(unsigned i=0; i<nnodes_ && ok; ++i)
+      for(unsigned k=0; k<ncv_ && ok; ++k)
+        if(!(in >> tmp[i][k])) ok = false;
+    if(!ok) continue;
+    double dist = 0.0;
+    std::vector<double> dx(ncv_);
+    for(unsigned i=0; i<nnodes_; ++i) {
+      for(unsigned k=0; k<ncv_; ++k)
+        dx[k] = getPntrToArgument(k)->difference(tmp[i][k], string_[i][k]);
+      dist += lenM(dx, Minv_[i]);
+    }
+    dist /= double(nnodes_);
+    out.width(8); out << s;
+    out.width(15); out << dist << '\n';
+  }
+}
+
 double ASM::scaleDpos(double x) const {
   // Exponential damping that prevents node-position inversions: the move
   // is throttled as |x| approaches the gap to the relevant neighbour.
@@ -789,6 +902,18 @@ void ASM::update() {
 
     reparametrizeLinear();
   }
+
+  // --- per-output_period snapshots & param logs (server only) ---
+  if(local_step > 0
+     && local_step % long(output_period_) == 0
+     && local_step >= start_step_) {
+    if(is_server_) {
+      writeSnapshot(local_step);
+      writeParams();
+      snapshot_steps_.push_back(local_step);
+      writeConvergence();
+    }
+  }
 }
 
 void ASM::calculate() {
@@ -807,6 +932,14 @@ void ASM::calculate() {
 
     // 3. Sync, build arclengths + tangents + B.
     reparametrizeLinear();
+
+    // 3.5  Output files (per-replica .dat opens here, after dir_ is known).
+    if(!outputs_opened_) { openOutputFiles(); outputs_opened_ = true; }
+    if(is_server_) {
+      writeSnapshot(0);
+      writeParams();
+      snapshot_steps_.push_back(0);
+    }
 
     // 4. Default K_l auto-tuning if user did not supply force_constant_l.
     if(K_l_local_ <= 0.0) {
@@ -857,6 +990,8 @@ void ASM::calculate() {
   // 4. Force-ramp / production accumulators.
   if(local_step < start_step_) {
     force_scale_ = std::min(1.0, double(local_step) / double(preparation_steps_));
+    dz_tmp_last_.assign(ncv_, 0.0);
+    writeDat();
     return;     // no accumulation during preparation
   }
   force_scale_ = 1.0;
@@ -898,6 +1033,8 @@ void ASM::calculate() {
     dpos_ += dpos_tmp;
     dK_   += dK_tmp;
   }
+  dz_tmp_last_ = dz_tmp;
+  writeDat();
 }
 
 void ASM::apply() {
