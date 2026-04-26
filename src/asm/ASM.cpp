@@ -32,6 +32,7 @@
 #include "tools/Communicator.h"
 #include "tools/File.h"
 #include "tools/Matrix.h"
+#include "tools/Random.h"
 #include "CubicSplineLS.h"
 
 #include <array>
@@ -201,6 +202,13 @@ private:
   std::string ckptPath() const;
   void writeCheckpoint(long local_step) const;
   void readCheckpoint();            // called from constructor when RESTART YES
+
+  // replica exchange
+  std::vector<unsigned> node_to_rank_;   // global, consistent on all ranks
+  Random rex_rng_;
+  bool   rex_rng_seeded_ = false;
+  void attemptReplicaExchange(long local_step);
+  double biasEnergyAt(unsigned node_idx, const std::vector<double>& cv_at_partner) const;
 
   // first-call guard for one-time work in reparametrizeLinear
   bool first_reparametrize_ = true;
@@ -389,6 +397,8 @@ ASM::ASM(const ActionOptions& ao):
 
   // ---- buffers --------------------------------------------------------
   outputForces_.assign(ncv_, 0.0);
+  node_to_rank_.resize(nnodes_);
+  for(unsigned i=0; i<nnodes_; ++i) node_to_rank_[i] = i;
   string_.assign(nnodes_, std::vector<double>(ncv_, 0.0));
   n_vec_ .assign(nnodes_, std::vector<double>(ncv_, 0.0));
   Mav_   .assign(nnodes_, std::vector<double>(msize_, 0.0));
@@ -877,6 +887,135 @@ void ASM::readCheckpoint() {
              saved_local_step, fname.c_str());
 }
 
+// ----- replica exchange (sander asm.F90:1017-1183) ------------------------
+
+double ASM::biasEnergyAt(unsigned node_idx,
+                         const std::vector<double>& cv_at) const {
+  // 0.5 * (cv_at - string_[node_idx])^T B_[node_idx] (cv_at - string_[node_idx])
+  std::vector<double> dCV(ncv_);
+  for(unsigned k=0; k<ncv_; ++k) {
+    dCV[k] = getPntrToArgument(k)->difference(string_[node_idx][k], cv_at[k]);
+  }
+  return 0.5 * dotProductM(dCV, dCV, B_[node_idx]);
+}
+
+void ASM::attemptReplicaExchange(long local_step) {
+  if(REX_period_ == 0 || nnodes_ < 2) return;
+
+  if(!rex_rng_seeded_) {
+    // Seed deterministically off rank 0 only; we Bcast all decisions, so
+    // ranks > 0 never need their RNG state.
+    rex_rng_.setSeed(- (long)(plumed.multi_sim_comm.Get_rank()) - 12345 - long(getStep()));
+    rex_rng_seeded_ = true;
+  }
+
+  // ---- Allgather per-rank packet --------------------------------------
+  // packet layout (per rank): node_(double), cv[ncv], dz[ncv], dpos, dK,
+  // mean_dx, mean_sigma2  →  1 + 2*ncv + 4 doubles.
+  const unsigned pack_n = 1 + 2u*ncv_ + 4u;
+  std::vector<double> sendbuf(pack_n);
+  unsigned p = 0;
+  sendbuf[p++] = double(node_);
+  for(unsigned k=0; k<ncv_; ++k) sendbuf[p++] = getArgument(k);
+  for(unsigned k=0; k<ncv_; ++k) sendbuf[p++] = dz_[k];
+  sendbuf[p++] = dpos_;
+  sendbuf[p++] = dK_;
+  sendbuf[p++] = mean_dx_;
+  sendbuf[p++] = mean_sigma2_;
+
+  std::vector<double> recvbuf(pack_n*nnodes_, 0.0);
+  if(comm.Get_rank() == 0) {
+    plumed.multi_sim_comm.Allgather(sendbuf, recvbuf);
+  }
+  comm.Bcast(recvbuf, 0);
+
+  // ---- Reorder by node_ so [i] is the data of the rank currently at node i.
+  std::vector<unsigned> rank_of_node(nnodes_, 0);
+  std::vector<std::vector<double>> cv_by_node(nnodes_, std::vector<double>(ncv_));
+  std::vector<std::vector<double>> dz_by_node(nnodes_, std::vector<double>(ncv_));
+  std::vector<double> dpos_by_node(nnodes_), dK_by_node(nnodes_);
+  std::vector<double> mdx_by_node(nnodes_),  ms2_by_node(nnodes_);
+  for(unsigned r=0; r<nnodes_; ++r) {
+    const double* rp = &recvbuf[r*pack_n];
+    const unsigned n = unsigned(rp[0]);
+    if(n >= nnodes_) continue;       // defensive; should never happen
+    rank_of_node[n] = r;
+    unsigned q = 1;
+    for(unsigned k=0; k<ncv_; ++k) cv_by_node[n][k] = rp[q++];
+    for(unsigned k=0; k<ncv_; ++k) dz_by_node[n][k] = rp[q++];
+    dpos_by_node[n] = rp[q++];
+    dK_by_node[n]   = rp[q++];
+    mdx_by_node[n]  = rp[q++];
+    ms2_by_node[n]  = rp[q++];
+  }
+  // Update the cached node_to_rank_ from the freshly observed mapping.
+  for(unsigned i=0; i<nnodes_; ++i) node_to_rank_[i] = rank_of_node[i];
+
+  // ---- Decide acceptance for alternating adjacent pairs ----------------
+  // Only rank 0 of multi_sim_comm rolls; broadcast the decisions so every
+  // rank reaches the same conclusion without RNG-sync gymnastics.
+  std::vector<int> accept(nnodes_, 0);          // accept[i] => pair (i, i+1)
+  if(comm.Get_rank() == 0 && plumed.multi_sim_comm.Get_rank() == 0) {
+    const long iter = local_step / long(REX_period_);
+    const unsigned phase = unsigned(iter & 1);  // 0: pairs (0,1),(2,3),...
+    for(unsigned i=phase; i+1<nnodes_; i+=2) {
+      const double Eii   = biasEnergyAt(i,   cv_by_node[i]);
+      const double Ejj   = biasEnergyAt(i+1, cv_by_node[i+1]);
+      const double Eij   = biasEnergyAt(i,   cv_by_node[i+1]);
+      const double Eji   = biasEnergyAt(i+1, cv_by_node[i]);
+      const double dE    = Eij + Eji - Eii - Ejj;
+      const double prob  = (dE > 0.0) ? std::exp(-dE / RT_) : 1.0;
+      const double rnd   = rex_rng_.RandU01();
+      if(prob >= rnd) accept[i] = 1;
+    }
+  }
+  if(comm.Get_rank() == 0) plumed.multi_sim_comm.Bcast(accept, 0);
+  comm.Bcast(accept, 0);
+
+  // ---- Apply accepted swaps -------------------------------------------
+  bool i_swapped = false;
+  for(unsigned i=0; i+1<nnodes_; ++i) {
+    if(!accept[i]) continue;
+    // Determine if THIS rank is the lower or upper partner of (i, i+1).
+    // "This rank" comparison goes via plumed.multi_sim_comm's rank since
+    // node_to_rank_[i] was filled from that side of the gather.
+    const unsigned my_msc_rank = plumed.multi_sim_comm.Get_rank();
+    const bool i_am_lower = (my_msc_rank == node_to_rank_[i]);
+    const bool i_am_upper = (my_msc_rank == node_to_rank_[i+1]);
+
+    if(i_am_lower) {
+      for(unsigned k=0; k<ncv_; ++k) dz_[k] = dz_by_node[i+1][k];
+      dpos_         = dpos_by_node[i+1];
+      dK_           = dK_by_node[i+1];
+      mean_dx_      = mdx_by_node[i+1];
+      mean_sigma2_  = ms2_by_node[i+1];
+      node_         = i+1;
+      i_swapped = true;
+    } else if(i_am_upper) {
+      for(unsigned k=0; k<ncv_; ++k) dz_[k] = dz_by_node[i][k];
+      dpos_         = dpos_by_node[i];
+      dK_           = dK_by_node[i];
+      mean_dx_      = mdx_by_node[i];
+      mean_sigma2_  = ms2_by_node[i];
+      node_         = i;
+      i_swapped = true;
+    }
+
+    // Update the global mapping the same way on every rank.
+    std::swap(node_to_rank_[i], node_to_rank_[i+1]);
+  }
+
+  if(i_swapped) {
+    is_terminal_ = (node_ == 0 || node_+1 == nnodes_);
+    is_server_   = (node_ == 0);
+    // After a swap, B_[new node_], n_vec_[new node_], Minv_[new node_] are
+    // someone else's stale cached state. The next reparametrize_linear call
+    // (which runs every string_move_period) refreshes them; force one now
+    // so the next calculate sees a consistent bias.
+    reparametrizeLinear();
+  }
+}
+
 double ASM::scaleDpos(double x) const {
   // Exponential damping that prevents node-position inversions: the move
   // is throttled as |x| approaches the gap to the relevant neighbour.
@@ -1017,6 +1156,12 @@ void ASM::update() {
     dK_   = 0.0;
 
     reparametrizeLinear();
+  }
+
+  // --- internal replica exchange ---
+  if(REX_period_ > 0 && local_step >= start_step_
+     && local_step % long(REX_period_) == 0) {
+    attemptReplicaExchange(local_step);
   }
 
   // --- per-output_period snapshots & param logs (server only) ---
