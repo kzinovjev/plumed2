@@ -1,0 +1,7 @@
+t1: TORSION ATOMS=1,2,3,4
+t2: TORSION ATOMS=3,4,5,6
+mypath: FUNCPATHASM ARG=t1,t2 REFERENCE=pathCV.def
+PRINT ARG=mypath.s,mypath.z FILE=colvar FMT=%8.4f
+DUMPDERIVATIVES ARG=mypath.s FILE=deriv_s FMT=%8.4f
+DUMPDERIVATIVES ARG=mypath.z FILE=deriv_z FMT=%8.4f
+RESTRAINT ARG=mypath.s AT=0.5 KAPPA=10.0
