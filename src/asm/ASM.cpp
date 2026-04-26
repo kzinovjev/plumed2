@@ -177,6 +177,14 @@ private:
   void gatherStringAcrossReplicas();
   void gatherKlAcrossReplicas();
 
+  // initial-guess (sander guess_file)
+  std::vector<std::vector<double>> guess_string_;   // [ninit][ncv], empty if not used
+  std::vector<std::vector<double>> guess_Minv_;     // [ninit][msize], populated only if read_M
+  void readGuessFile(const std::string& path);
+  void interpolateLinear(const std::vector<std::vector<double>>& src,
+                         std::vector<std::vector<double>>&       dst,
+                         const std::vector<double>&              metric_packed) const;
+
   // string-method helpers
   void initStringFromCurrentCV();
   void buildArcLengths();           // sets L_ from |string[i+1]-string[i]|_Minv
@@ -429,9 +437,10 @@ ASM::ASM(const ActionOptions& ao):
     RT_ = 2.5;
   }
 
-  // Initial-guess file (parsing only; file reader not implemented yet).
+  // Initial-guess file (sander format).
   std::string guess_file;
   parse("GUESS_FILE", guess_file);
+  if(!guess_file.empty()) readGuessFile(guess_file);
 
   checkRead();
 
@@ -602,6 +611,88 @@ void ASM::gatherKlAcrossReplicas() {
   }
   comm.Bcast(recv, 0);
   for(unsigned i=0; i<nnodes_; ++i) K_l_[i] = recv[i];
+}
+
+void ASM::readGuessFile(const std::string& path) {
+  // Sander guess-file format (asm.F90:380-396):
+  //   line 1:    ninit (integer)
+  //   following: ninit*ncv doubles in row-major order — each row is one
+  //              point's CV vector. (Sander reads column-major into a
+  //              (ncv, ninit) array; for free-format Fortran read this
+  //              is functionally identical to whitespace-separated
+  //              ninit*ncv values.)
+  //   if read_M: ninit*msize doubles for the per-point Minv (lower-tri
+  //              packed, same layout as our Mav_/Minv_ packing).
+  std::ifstream in(path);
+  if(!in) error("ASM: cannot open GUESS_FILE '" + path + "'");
+  unsigned ninit = 0;
+  if(!(in >> ninit) || ninit == 0) {
+    error("ASM: failed to read ninit from GUESS_FILE '" + path + "'");
+  }
+  guess_string_.assign(ninit, std::vector<double>(ncv_, 0.0));
+  for(unsigned i=0; i<ninit; ++i) {
+    for(unsigned k=0; k<ncv_; ++k) {
+      if(!(in >> guess_string_[i][k])) {
+        error("ASM: GUESS_FILE '" + path + "' truncated reading point "
+              + std::to_string(i) + " CV " + std::to_string(k));
+      }
+    }
+  }
+  if(read_M_) {
+    guess_Minv_.assign(ninit, std::vector<double>(msize_, 0.0));
+    for(unsigned i=0; i<ninit; ++i) {
+      for(unsigned k=0; k<msize_; ++k) {
+        if(!(in >> guess_Minv_[i][k])) {
+          error("ASM: GUESS_FILE '" + path + "' truncated reading Minv "
+                "for point " + std::to_string(i));
+        }
+      }
+    }
+  }
+  log.printf("    read initial-guess string with %u points from %s%s\n",
+             ninit, path.c_str(), read_M_ ? " (incl. Minv)" : "");
+}
+
+void ASM::interpolateLinear(const std::vector<std::vector<double>>& src,
+                            std::vector<std::vector<double>>&       dst,
+                            const std::vector<double>&              metric_packed) const {
+  // Resample src (ninit points) onto dst (nnodes_ points) at equally-spaced
+  // arc-lengths in the supplied metric. Endpoints preserved. (sander
+  // interpolate_linear at asm.F90:402-445.)
+  const unsigned ninit  = src.size();
+  const unsigned nfinal = dst.size();
+  plumed_assert(ninit >= 2 && nfinal >= 2);
+
+  // Continuous (un-PBC-wrapped) copy of src for the arc-length sum.
+  std::vector<std::vector<double>> A = src;
+  for(unsigned k=0; k<ncv_; ++k) {
+    Value* v = getPntrToArgument(k);
+    if(!v->isPeriodic()) continue;
+    for(unsigned i=1; i<ninit; ++i) {
+      const double d = v->difference(A[i-1][k], A[i][k]);
+      A[i][k] = A[i-1][k] + d;
+    }
+  }
+
+  // Arc lengths in the supplied metric.
+  std::vector<double> L(ninit, 0.0);
+  std::vector<double> dx(ncv_);
+  for(unsigned i=1; i<ninit; ++i) {
+    for(unsigned k=0; k<ncv_; ++k) dx[k] = A[i][k] - A[i-1][k];
+    L[i] = L[i-1] + lenM(dx, metric_packed);
+  }
+  const double Ltot = L[ninit-1];
+
+  dst[0]        = A[0];
+  dst[nfinal-1] = A[ninit-1];
+  unsigned j = 1;
+  for(unsigned i=1; i+1<nfinal; ++i) {
+    const double Lnew = Ltot * double(i) / double(nfinal-1);
+    while(j+1 < ninit && L[j] < Lnew) ++j;
+    const double denom = L[j] - L[j-1];
+    const double frac  = (denom > 0.0) ? (Lnew - L[j-1]) / denom : 0.0;
+    for(unsigned k=0; k<ncv_; ++k) dst[i][k] = A[j-1][k] + (A[j][k] - A[j-1][k])*frac;
+  }
 }
 
 void ASM::initStringFromCurrentCV() {
@@ -1192,16 +1283,48 @@ void ASM::calculate() {
 
     // 1. Initial metric sample. (sander asm.F90:301-303.)
     //    On restart we already have a saved Mav from the checkpoint and
-    //    must not overwrite it with a one-step sample.
-    if(!read_M_ && !restarted_) {
-      buildLocalMetric(Mav_[node_]);
+    //    must not overwrite it with a one-step sample. With read_M and a
+    //    guess file holding Minv we seed Mav from the file's per-node Minv.
+    if(read_M_ && !guess_Minv_.empty() && !restarted_) {
+      // Pick the guess-Minv slot matching this node — interpolate when the
+      // guess has a different point count, otherwise direct copy.
+      if(guess_Minv_.size() == nnodes_) {
+        Minv_[node_] = guess_Minv_[node_];
+      } else {
+        // For the metric, "linear interpolation between Minv tensors" is a
+        // crude but standard fallback — picks the nearest guess point.
+        const unsigned src_idx = (node_ * (guess_Minv_.size()-1)) / (nnodes_-1);
+        Minv_[node_] = guess_Minv_[src_idx];
+      }
+      invertPacked(Minv_[node_], Mav_[node_]);
+    } else {
+      if(!read_M_ && !restarted_) buildLocalMetric(Mav_[node_]);
+      invertPacked(Mav_[node_], Minv_[node_]);
     }
-    invertPacked(Mav_[node_], Minv_[node_]);
 
-    // 2. Initial string positions: current ARG values at each replica.
-    //    (read_initial_guess deferred until we wire up file parsing.)
-    //    On restart, string_[node_] was loaded from the checkpoint.
-    if(!restarted_) initStringFromCurrentCV();
+    // 2. Initial string positions:
+    //    - on restart, string_[node_] was loaded from the checkpoint.
+    //    - with a guess file: each replica seeds string_[node_] from the
+    //      guess (interpolated to nnodes_ if the file has a different
+    //      point count). Sander uses the average Mav across replicas for
+    //      the interpolation metric; we approximate with this rank's Minv,
+    //      which is fine since the interpolation only sets the initial
+    //      arc-length spacing.
+    //    - otherwise: each replica's current ARG values become its node.
+    if(!restarted_) {
+      if(!guess_string_.empty()) {
+        std::vector<std::vector<double>> resampled(nnodes_,
+                                                   std::vector<double>(ncv_, 0.0));
+        if(guess_string_.size() == nnodes_) {
+          resampled = guess_string_;
+        } else {
+          interpolateLinear(guess_string_, resampled, Minv_[node_]);
+        }
+        string_[node_] = resampled[node_];
+      } else {
+        initStringFromCurrentCV();
+      }
+    }
 
     // 3. Sync, build arclengths + tangents + B.
     reparametrizeLinear();
