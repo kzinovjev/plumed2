@@ -176,11 +176,20 @@ private:
 
   // string-method helpers
   void initStringFromCurrentCV();
-  void buildArcLengths();           // sets pos_ from |string[i+1]-string[i]|_Minv
+  void buildArcLengths();           // sets L_ from |string[i+1]-string[i]|_Minv
   void computeTangentsFD();         // tangent at each node from finite differences
   void normaliseTangentLocal();     // n_vec_[node_] /= ||n_vec_[node_]||_Minv
   void updateBLocal();              // B[node_] from K_l, K_d, n_vec, Minv
   void reparametrizeLinear();       // gather + arclength + tangent + updateB
+  void toContinuousString();        // unwrap periodic CVs along the string
+  void toBoxLocalNode();            // wrap string_[node_] back into PBC range
+  void fitStringSpline();           // smoothing cubic spline over arc-length
+  void splineTangentLocal();        // n_vec_[node_] from spline derivative at pos_[node_]
+  double scaleDpos(double x) const; // sander scale_dpos: damping near the neighbour gap
+
+  // first-call guard for one-time work in reparametrizeLinear
+  bool first_reparametrize_ = true;
+  std::vector<double> L_;            // arc lengths to each node (rebuilt every reparam)
 };
 
 PLUMED_REGISTER_ACTION(ASM, "ASM")
@@ -575,19 +584,80 @@ void ASM::initStringFromCurrentCV() {
 
 void ASM::buildArcLengths() {
   // Cumulative metric-weighted arc length along the (continuous-on-PBC)
-  // string. pos_[0] = 0 ; pos_[i] = pos_[i-1] + ||string_[i]-string_[i-1]||_M
-  // using the average of the two adjacent Minv-tensors (same convention as
-  // sander's reparameterize_linear, asm.F90:1218-1222).
-  pos_[0] = 0.0;
+  // string. L_[0] = 0; L_[i] = L_[i-1] + ||string_[i]-string_[i-1]||_M
+  // using the average of the two adjacent Minv-tensors. (sander
+  // reparameterize_linear, asm.F90:1218-1222.)
+  L_.assign(nnodes_, 0.0);
   std::vector<double> dx(ncv_), Mavg(msize_);
   for(unsigned i=1; i<nnodes_; ++i) {
     for(unsigned k=0; k<ncv_; ++k) {
       dx[k] = getPntrToArgument(k)->difference(string_[i-1][k], string_[i][k]);
     }
     for(unsigned k=0; k<msize_; ++k) Mavg[k] = 0.5*(Minv_[i-1][k] + Minv_[i][k]);
-    pos_[i] = pos_[i-1] + lenM(dx, Mavg);
+    L_[i] = L_[i-1] + lenM(dx, Mavg);
   }
-  string_length_ = pos_[nnodes_-1];
+  string_length_ = L_[nnodes_-1];
+}
+
+void ASM::toContinuousString() {
+  // For each periodic CV, unwrap the string so consecutive nodes differ by
+  // at most half a period — required for a sensible spline fit and for
+  // monotone arc-length accumulation. (sander to_continuous.)
+  for(unsigned k=0; k<ncv_; ++k) {
+    Value* v = getPntrToArgument(k);
+    if(!v->isPeriodic()) continue;
+    for(unsigned i=1; i<nnodes_; ++i) {
+      const double d = v->difference(string_[i-1][k], string_[i][k]);
+      string_[i][k] = string_[i-1][k] + d;
+    }
+  }
+}
+
+void ASM::toBoxLocalNode() {
+  // Wrap this replica's node back into the canonical periodic range.
+  for(unsigned k=0; k<ncv_; ++k) {
+    Value* v = getPntrToArgument(k);
+    if(v->isPeriodic()) string_[node_][k] = v->bringBackInPbc(string_[node_][k]);
+  }
+}
+
+void ASM::fitStringSpline() {
+  // Smoothing cubic-spline fit over arc length (sander allocates
+  // string_spline_smooth(nnodes/2-1, ...). For small nnodes (<4) the LS
+  // fit degenerates; in that regime the FD tangent is fine and we leave
+  // string_spline_ empty as a signal to fall back.
+  string_spline_.clear();
+  if(nnodes_ < 4) return;
+  const unsigned nseg = std::max(1u, (nnodes_ / 2u) - 1u);
+
+  // Pack y = [ncv][nnodes] (transpose of string_).
+  std::vector<std::vector<double>> y(ncv_, std::vector<double>(nnodes_));
+  for(unsigned k=0; k<ncv_; ++k)
+    for(unsigned i=0; i<nnodes_; ++i) y[k][i] = string_[i][k];
+
+  string_spline_.assign(ncv_, Spline1D(nseg));
+  cubicSplinesFitND(L_, y, string_spline_);
+}
+
+void ASM::splineTangentLocal() {
+  // Tangent at this node from the spline derivative at pos_[node_].
+  // Falls back to the existing finite-difference value when the spline
+  // wasn't fit (string_spline_ empty).
+  if(string_spline_.empty()) return;
+  std::vector<double> der = splineDerND(pos_[node_], string_spline_);
+  for(unsigned k=0; k<ncv_; ++k) n_vec_[node_][k] = der[k];
+}
+
+double ASM::scaleDpos(double x) const {
+  // Exponential damping that prevents node-position inversions: the move
+  // is throttled as |x| approaches the gap to the relevant neighbour.
+  // (sander scale_dpos at asm.F90:627-636.)
+  if(node_ == 0 || node_ + 1 >= nnodes_) return x;
+  const double gap_right = pos_[node_+1] - pos_[node_];
+  const double gap_left  = pos_[node_]   - pos_[node_-1];
+  const double d = (x > 0.0) ? gap_right : gap_left;
+  if(d <= 0.0) return 0.0;
+  return x * std::exp(-x*x / (d*d) * 4.0);
 }
 
 void ASM::computeTangentsFD() {
@@ -635,15 +705,90 @@ void ASM::updateBLocal() {
 }
 
 void ASM::reparametrizeLinear() {
-  // First-pass implementation: sync state across replicas, recompute arc
-  // lengths and string_length_, refresh per-node tangents (finite-diff for
-  // now — spline tangent + node redistribution come with the next commit),
-  // then rebuild B for this replica.
+  // sander reparameterize_linear at asm.F90:1189-1268. Order: gather, unwrap
+  // periodic CVs, scale K_l by old length^2, recompute arc lengths and
+  // string_length_, divide K_l back by new length^2, redistribute non-
+  // terminal nodes onto the new equal-step lattice, allgather updated
+  // string + pos, fit smoothing spline, extract tangent, normalise, rebuild B.
   gatherStringAcrossReplicas();
+  toContinuousString();
+
+  const double old_length = string_length_;
+  if(rescale_forces_ && !first_reparametrize_ && old_length > 0.0) {
+    for(auto& k : K_l_) k *= old_length*old_length;
+  }
   buildArcLengths();
-  computeTangentsFD();
+  if(rescale_forces_ && !first_reparametrize_ && string_length_ > 0.0) {
+    for(auto& k : K_l_) k /= string_length_*string_length_;
+  }
+
+  // Initialise pos_ to equal-step on first reparametrize; otherwise rescale
+  // proportionally to the new total length (sander asm.F90:1230-1235).
+  if(first_reparametrize_) {
+    for(unsigned i=0; i<nnodes_; ++i) {
+      pos_[i] = string_length_ * double(i) / double(nnodes_-1);
+    }
+  } else if(string_move_ && pos_[nnodes_-1] > 0.0) {
+    const double scale = string_length_ / pos_[nnodes_-1];
+    for(unsigned i=0; i<nnodes_; ++i) pos_[i] *= scale;
+  }
+
+  // Linear interpolation: redistribute non-terminal nodes onto pos_[node_].
+  if(!is_terminal_) {
+    unsigned j = 1;
+    while(j+1 < nnodes_ && L_[j] < pos_[node_]) ++j;
+    const double denom = L_[j] - L_[j-1];
+    const double frac = (denom > 0.0) ? (pos_[node_] - L_[j-1])/denom : 0.0;
+    std::vector<double> dz(ncv_);
+    for(unsigned k=0; k<ncv_; ++k) {
+      const double seg = getPntrToArgument(k)->difference(string_[j-1][k], string_[j][k]);
+      dz[k] = string_[j-1][k] + seg*frac - string_[node_][k];
+    }
+    for(unsigned k=0; k<ncv_; ++k) string_[node_][k] += dz[k];
+  }
+
+  // Re-sync after the local redistribution.
+  gatherStringAcrossReplicas();
+
+  // Smoothing spline + tangent extraction.
+  fitStringSpline();
+  computeTangentsFD();          // baseline
+  splineTangentLocal();         // override with spline derivative if available
   normaliseTangentLocal();
   updateBLocal();
+  toBoxLocalNode();
+
+  first_reparametrize_ = false;
+}
+
+void ASM::update() {
+  if(first_calculate_) return;        // first call to update() comes before calculate's init
+  const long local_step = getStep() + step0_;
+
+  // --- string motion (sander asm.F90:592-602) ---
+  if(string_move_ && local_step >= start_step_
+     && long(local_step) % long(string_move_period_) == 0) {
+
+    const double dt = getTimeStep();
+    const double inv_smp = dt / double(string_move_period_);
+
+    if(!(fix_ends_ && is_terminal_)) {
+      const double scale = inv_smp / gamma_;
+      for(unsigned k=0; k<ncv_; ++k) string_[node_][k] += dz_[k] * scale;
+    }
+    if(!is_terminal_) {
+      const double raw = dpos_ * inv_smp / position_gamma_;
+      pos_[node_] += scaleDpos(raw);
+    }
+    K_l_[node_] += dK_ * inv_smp / force_gamma_;
+
+    gatherKlAcrossReplicas();
+    std::fill(dz_.begin(), dz_.end(), 0.0);
+    dpos_ = 0.0;
+    dK_   = 0.0;
+
+    reparametrizeLinear();
+  }
 }
 
 void ASM::calculate() {
@@ -753,10 +898,6 @@ void ASM::calculate() {
     dpos_ += dpos_tmp;
     dK_   += dK_tmp;
   }
-}
-
-void ASM::update() {
-  // String-evolution + reparametrization + outputs land in the next commit.
 }
 
 void ASM::apply() {
