@@ -191,8 +191,8 @@ double Value::projection(const Value& v1,const Value&v2) {
   return proj;
 }
 
-double Value::projectionWithMasses(const Value& v1, const Value& v2,
-                                   const std::vector<double>& mass_by_index) {
+double Value::projectionWithAtomWeights(const Value& v1, const Value& v2,
+                                        const std::vector<double>& atom_weights) {
   double proj=0.0;
   const std::map<AtomNumber,Vector> & grad1(v1.gradients);
   const std::map<AtomNumber,Vector> & grad2(v2.gradients);
@@ -201,8 +201,8 @@ double Value::projectionWithMasses(const Value& v1, const Value& v2,
     const auto p2=grad2.find(a);
     if(p2==grad2.end()) continue;
     const std::size_t idx=a.index();
-    plumed_assert(idx<mass_by_index.size());
-    proj+=mass_by_index[idx]*dotProduct(p1.second,(*p2).second);
+    plumed_assert(idx<atom_weights.size());
+    proj+=atom_weights[idx]*dotProduct(p1.second,(*p2).second);
   }
   return proj;
 }

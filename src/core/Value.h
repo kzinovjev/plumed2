@@ -194,11 +194,11 @@ public:
 /// This passes gradients from one action to another
   void passGradients( const double& der, std::map<AtomNumber,Vector>& g ) const ;
   static double projection(const Value&,const Value&);
-/// Mass-weighted projection: Σ_a m_a (∇v1)_a · (∇v2)_a, where m_a is looked up
-/// in mass_by_index keyed by AtomNumber::index(). Used by the ASM action to
-/// build the mass-weighted metric tensor.
-  static double projectionWithMasses(const Value& v1, const Value& v2,
-                                     const std::vector<double>& mass_by_index);
+/// Per-atom-weighted projection of two CV gradients:
+/// Σ_a w_a (∇v1)_a · (∇v2)_a, with w_a indexed by AtomNumber::index().
+/// Used by the ASM action to assemble its CV-space metric tensor.
+  static double projectionWithAtomWeights(const Value& v1, const Value& v2,
+                                          const std::vector<double>& atom_weights);
 /// Get the rank of the object that is contained in this value
   unsigned getRank() const ;
 /// Get the shape of the object that is contained in this value

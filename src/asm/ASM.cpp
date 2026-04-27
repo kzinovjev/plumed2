@@ -80,13 +80,15 @@ private:
   unsigned checkpoint_period_   = 0;
   unsigned REX_period_          = 0;
   long     start_step_          = 0;
-  // local_step = getStep() + step0_ - preparation_steps_  (sander signed
-  // convention: negative during preparation, 0 = first production step).
-  // Cold start: step0_ = 0. Restart: step0_ = saved_local_step + preparation_steps_.
+  // local_step = getStep() + step0_ - preparation_steps_ + 1.
+  // The +1 mirrors sander's pre-increment of `step`.
+  // Cold start: step0_ = 0. Restart: step0_ chosen so the first
+  // post-restart calculate reproduces the saved local_step.
   long     step0_               = 0;
 
-  // -------- mass cache --------------------------------------------------
-  std::vector<double> mass_by_index_;
+  // 1/m_a per atom, indexed by AtomNumber::index(); fed to
+  // Value::projectionWithAtomWeights to assemble the metric tensor.
+  std::vector<double> inv_atom_mass_by_index_;
   bool                masses_cached_ = false;
 
   // -------- string state (one slot per node, replica owns slot node_) ---
@@ -487,17 +489,19 @@ ASM::ASM(const ActionOptions& ao):
 void ASM::cacheMasses() {
   if(masses_cached_) return;
   const unsigned nat = getNumberOfAtoms();
-  // Index mass_by_index_ by AtomNumber::index() (absolute index in the MD
-  // topology), so that gradient-map keys can directly look it up.
+  // Indexed by AtomNumber::index() so gradient-map keys can look it up
+  // directly. Massless atoms (m=0) get weight 0 — they would otherwise
+  // give 1/m = inf and corrupt the metric.
   std::size_t maxidx = 0;
   for(unsigned i=0; i<nat; ++i) {
     const std::size_t k = getAbsoluteIndex(i).index();
     if(k > maxidx) maxidx = k;
   }
-  mass_by_index_.assign(maxidx + 1, 0.0);
+  inv_atom_mass_by_index_.assign(maxidx + 1, 0.0);
   for(unsigned i=0; i<nat; ++i) {
     const std::size_t k = getAbsoluteIndex(i).index();
-    mass_by_index_[k] = getMass(i);
+    const double m = getMass(i);
+    inv_atom_mass_by_index_[k] = (m > 0.0) ? (1.0 / m) : 0.0;
   }
   masses_cached_ = true;
 }
@@ -534,9 +538,9 @@ void ASM::buildLocalMetric(std::vector<double>& Mout) {
   unsigned p = 0;
   for(unsigned i=0; i<ncv_; ++i) {
     for(unsigned j=0; j<=i; ++j) {
-      Mout[p++] = Value::projectionWithMasses(*getPntrToArgument(i),
-                                              *getPntrToArgument(j),
-                                              mass_by_index_);
+      Mout[p++] = Value::projectionWithAtomWeights(*getPntrToArgument(i),
+                                                   *getPntrToArgument(j),
+                                                   inv_atom_mass_by_index_);
     }
   }
 }
@@ -878,18 +882,30 @@ void ASM::writeConvergence() const {
   // (sander write_convergence at asm.F90:927-968.)
   const std::string fname = dir_ + "convergence.dat";
   std::ofstream out(fname);
-  if(!out) return;
+  if(!out) {
+    log.printf("WARNING: ASM cannot open %s for write\n", fname.c_str());
+    return;
+  }
   out.setf(std::ios::fixed); out.precision(5);
   std::vector<std::vector<double>> tmp(nnodes_, std::vector<double>(ncv_));
+  unsigned rows_written = 0;
   for(long s : snapshot_steps_) {
     const std::string sfname = dir_ + std::to_string(s) + ".string";
     std::ifstream in(sfname);
-    if(!in) continue;
+    if(!in) {
+      log.printf("WARNING: ASM convergence skipped %s (open failed)\n",
+                 sfname.c_str());
+      continue;
+    }
     bool ok = true;
     for(unsigned i=0; i<nnodes_ && ok; ++i)
       for(unsigned k=0; k<ncv_ && ok; ++k)
         if(!(in >> tmp[i][k])) ok = false;
-    if(!ok) continue;
+    if(!ok) {
+      log.printf("WARNING: ASM convergence skipped %s (read failed)\n",
+                 sfname.c_str());
+      continue;
+    }
     double dist = 0.0;
     std::vector<double> dx(ncv_);
     for(unsigned i=0; i<nnodes_; ++i) {
@@ -898,8 +914,19 @@ void ASM::writeConvergence() const {
       dist += lenM(dx, Minv_[i]);
     }
     dist /= double(nnodes_);
+    if(!std::isfinite(dist)) {
+      log.printf("WARNING: ASM convergence row %ld is non-finite — current "
+                 "string contains NaN/Inf, writing 0.0\n", s);
+      dist = 0.0;
+    }
     out.width(8); out << s;
     out.width(15); out << dist << '\n';
+    ++rows_written;
+  }
+  out.flush();
+  if(rows_written == 0 && !snapshot_steps_.empty()) {
+    log.printf("WARNING: ASM convergence wrote 0 rows despite %zu snapshot(s) "
+               "in history\n", snapshot_steps_.size());
   }
 }
 
@@ -1007,9 +1034,9 @@ void ASM::readCheckpoint() {
           + std::to_string(node_));
   }
   K_l_[node_] = K_l_local_;
-  // local_step = getStep() + step0_ - preparation_steps_; pick step0_ so that
-  // the first post-restart calculate (getStep()=0) reproduces the saved value.
-  step0_ = saved_local_step + long(preparation_steps_);
+  // Pick step0_ so the first post-restart calculate (getStep()=0)
+  // reproduces saved_local_step under the local_step formula above.
+  step0_ = saved_local_step + long(preparation_steps_) - 1;
   first_reparametrize_ = false;     // skip the equal-spacing pos initialiser
   restarted_ = true;                // skip cold-start metric/string init in calculate()
   log.printf("  ASM RESTART: resumed at local_step=%ld from %s\n",
@@ -1259,7 +1286,7 @@ void ASM::reparametrizeLinear() {
 
 void ASM::update() {
   if(first_calculate_) return;        // first call to update() comes before calculate's init
-  const long local_step = getStep() + step0_ - long(preparation_steps_);
+  const long local_step = getStep() + step0_ - long(preparation_steps_) + 1;
 
   // --- string motion (sander asm.F90:592-602) ---
   if(string_move_ && local_step >= start_step_
@@ -1385,7 +1412,7 @@ void ASM::calculate() {
     if(!outputs_opened_) { openOutputFiles(); outputs_opened_ = true; }
     if(is_server_) {
       const long lstep0 =
-        restarted_ ? (getStep() + step0_ - long(preparation_steps_)) : 0L;
+        restarted_ ? (getStep() + step0_ - long(preparation_steps_) + 1) : 0L;
       writeSnapshot(lstep0);
       writeParams();
       snapshot_steps_.push_back(lstep0);
@@ -1395,7 +1422,7 @@ void ASM::calculate() {
     first_calculate_ = false;
   }
 
-  const long local_step = getStep() + step0_ - long(preparation_steps_);
+  const long local_step = getStep() + step0_ - long(preparation_steps_) + 1;
 
   // 1. Local metric sample (this step) — sander asm.F90:541.
   std::vector<double> M_now;
@@ -1427,11 +1454,9 @@ void ASM::calculate() {
     normaliseTangentLocal();
   }
 
-  // 4. Force-ramp / production accumulators.
-  //    Sander signed-step convention: local_step ∈ [-preparation_steps_, 0)
-  //    is preparation (force ramps 0→1, no .dat write), local_step ≥ 0 is
-  //    production. start_step_ optionally delays string evolution past the
-  //    start of production (default 0 = evolve immediately).
+  // 4. Force-ramp / production accumulators. local_step < 0 is preparation
+  //    (force ramps 0→1, no .dat write); start_step_ optionally delays
+  //    string evolution past the first production step.
   if(local_step < 0) {
     const long md_step = local_step + long(preparation_steps_);
     force_scale_ = std::min(1.0, double(md_step) / double(preparation_steps_));
