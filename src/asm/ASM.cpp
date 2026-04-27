@@ -80,7 +80,10 @@ private:
   unsigned checkpoint_period_   = 0;
   unsigned REX_period_          = 0;
   long     start_step_          = 0;
-  long     step0_               = 0; // local_step = getStep() + step0_
+  // local_step = getStep() + step0_ - preparation_steps_  (sander signed
+  // convention: negative during preparation, 0 = first production step).
+  // Cold start: step0_ = 0. Restart: step0_ = saved_local_step + preparation_steps_.
+  long     step0_               = 0;
 
   // -------- mass cache --------------------------------------------------
   std::vector<double> mass_by_index_;
@@ -176,6 +179,9 @@ private:
   // multi-replica state synchronisation
   void gatherStringAcrossReplicas();
   void gatherKlAcrossReplicas();
+  // Cross-replica average of Mav, inverted (sander asm.F90:388-390): used
+  // as a single consistent metric for cold-start guess interpolation.
+  void gatherMavMeanInverted(std::vector<double>& Mtmpinv) const;
 
   // initial-guess (sander guess_file)
   std::vector<std::vector<double>> guess_string_;   // [ninit][ncv], empty if not used
@@ -255,7 +261,8 @@ void ASM::registerKeywords(Keywords& keys) {
   keys.add("compulsory", "PREPARATION_STEPS", "1000",
            "steps over which the harmonic force ramps from 0 to 1");
   keys.add("optional", "START_STEP",
-           "step at which string evolution begins (default = PREPARATION_STEPS)");
+           "production step at which string evolution begins (default = 0, "
+           "i.e., immediately after preparation)");
   keys.add("compulsory", "STRING_MOVE_PERIOD", "1",
            "apply accumulated dz/dpos/dK every N steps");
 
@@ -368,9 +375,11 @@ ASM::ASM(const ActionOptions& ao):
 
   // ---- stage timing ----------------------------------------------------
   parse("PREPARATION_STEPS", preparation_steps_);
+  // START_STEP is now production-relative (sander signed convention): 0 means
+  // string evolution begins immediately at the first production step.
   long start_step_in = -1;
   parse("START_STEP", start_step_in);
-  start_step_ = (start_step_in >= 0) ? start_step_in : long(preparation_steps_);
+  start_step_ = (start_step_in >= 0) ? start_step_in : 0;
   parse("STRING_MOVE_PERIOD", string_move_period_);
 
   // ---- frictions / dynamics -------------------------------------------
@@ -613,6 +622,27 @@ void ASM::gatherKlAcrossReplicas() {
   for(unsigned i=0; i<nnodes_; ++i) K_l_[i] = recv[i];
 }
 
+void ASM::gatherMavMeanInverted(std::vector<double>& Mtmpinv) const {
+  // Sum each replica's Mav_[node_] across multi_sim_comm, divide by nnodes_,
+  // then invert. Equivalent to sander's mpi_allreduce(SUM)+matinv pair at
+  // asm.F90:388-390. Run on rank-0-of-comm and Bcast within comm so every
+  // MD rank of a replica sees the same metric.
+  std::vector<double> send(msize_), recv(msize_*nnodes_, 0.0);
+  for(unsigned k=0; k<msize_; ++k) send[k] = Mav_[node_][k];
+  if(comm.Get_rank() == 0) {
+    plumed.multi_sim_comm.Allgather(send, recv);
+  }
+  comm.Bcast(recv, 0);
+  std::vector<double> Mtmp(msize_, 0.0);
+  for(unsigned i=0; i<nnodes_; ++i) {
+    for(unsigned k=0; k<msize_; ++k) Mtmp[k] += recv[i*msize_ + k];
+  }
+  const double inv_n = 1.0 / double(nnodes_);
+  for(auto& x : Mtmp) x *= inv_n;
+  Mtmpinv.assign(msize_, 0.0);
+  invertPacked(Mtmp, Mtmpinv);
+}
+
 void ASM::readGuessFile(const std::string& path) {
   // Sander guess-file format (asm.F90:380-396):
   //   line 1:    ninit (integer)
@@ -779,7 +809,9 @@ void ASM::mkOutputDir() const {
 
 void ASM::openOutputFiles() {
   mkOutputDir();
-  const std::string fname = dir_ + std::to_string(node_) + ".dat";
+  // 1-based filename to match sander's 1.dat .. N.dat convention. Internal
+  // C++ indexing remains 0-based; only the on-disk name is offset.
+  const std::string fname = dir_ + std::to_string(node_ + 1) + ".dat";
   // Append mode so a restart continues an existing trajectory; sander's
   // assign_dat_file uses access="append" (asm.F90:484).
   dat_stream_.open(fname, std::ios::out | std::ios::app);
@@ -975,7 +1007,9 @@ void ASM::readCheckpoint() {
           + std::to_string(node_));
   }
   K_l_[node_] = K_l_local_;
-  step0_ = saved_local_step;        // local_step = getStep() + step0_ resumes
+  // local_step = getStep() + step0_ - preparation_steps_; pick step0_ so that
+  // the first post-restart calculate (getStep()=0) reproduces the saved value.
+  step0_ = saved_local_step + long(preparation_steps_);
   first_reparametrize_ = false;     // skip the equal-spacing pos initialiser
   restarted_ = true;                // skip cold-start metric/string init in calculate()
   log.printf("  ASM RESTART: resumed at local_step=%ld from %s\n",
@@ -1225,7 +1259,7 @@ void ASM::reparametrizeLinear() {
 
 void ASM::update() {
   if(first_calculate_) return;        // first call to update() comes before calculate's init
-  const long local_step = getStep() + step0_;
+  const long local_step = getStep() + step0_ - long(preparation_steps_);
 
   // --- string motion (sander asm.F90:592-602) ---
   if(string_move_ && local_step >= start_step_
@@ -1259,9 +1293,9 @@ void ASM::update() {
   }
 
   // --- per-output_period snapshots & param logs (server only) ---
+  // Production-only: gate on local_step > 0 (cold start already wrote step 0).
   if(local_step > 0
-     && local_step % long(output_period_) == 0
-     && local_step >= start_step_) {
+     && local_step % long(output_period_) == 0) {
     if(is_server_) {
       writeSnapshot(local_step);
       writeParams();
@@ -1306,10 +1340,9 @@ void ASM::calculate() {
     //    - on restart, string_[node_] was loaded from the checkpoint.
     //    - with a guess file: each replica seeds string_[node_] from the
     //      guess (interpolated to nnodes_ if the file has a different
-    //      point count). Sander uses the average Mav across replicas for
-    //      the interpolation metric; we approximate with this rank's Minv,
-    //      which is fine since the interpolation only sets the initial
-    //      arc-length spacing.
+    //      point count). Sander uses inv(mean_replicas(Mav)) as a single
+    //      consistent interpolation metric (asm.F90:388-391); we do the
+    //      same so all replicas produce the same resampled string.
     //    - otherwise: each replica's current ARG values become its node.
     if(!restarted_) {
       if(!guess_string_.empty()) {
@@ -1318,7 +1351,9 @@ void ASM::calculate() {
         if(guess_string_.size() == nnodes_) {
           resampled = guess_string_;
         } else {
-          interpolateLinear(guess_string_, resampled, Minv_[node_]);
+          std::vector<double> Mtmpinv;
+          gatherMavMeanInverted(Mtmpinv);
+          interpolateLinear(guess_string_, resampled, Mtmpinv);
         }
         string_[node_] = resampled[node_];
       } else {
@@ -1329,16 +1364,10 @@ void ASM::calculate() {
     // 3. Sync, build arclengths + tangents + B.
     reparametrizeLinear();
 
-    // 3.5  Output files (per-replica .dat opens here, after dir_ is known).
-    if(!outputs_opened_) { openOutputFiles(); outputs_opened_ = true; }
-    if(is_server_) {
-      const long lstep0 = getStep() + step0_;
-      writeSnapshot(lstep0);
-      writeParams();
-      snapshot_steps_.push_back(lstep0);
-    }
-
     // 4. Default K_l auto-tuning if user did not supply force_constant_l.
+    //    Must run before writeParams so force_constants.dat row 0 reflects
+    //    the actual initial K_l, and before updateBLocal so B is consistent.
+    //    (sander order: asm.F90:317-324.)
     if(K_l_local_ <= 0.0) {
       const double delta = string_length_ / double(nnodes_-1);
       K_l_local_ = RT_ / (0.25 * delta * delta);
@@ -1349,10 +1378,24 @@ void ASM::calculate() {
     }
     updateBLocal();
 
+    // 5. Open output files and write the cold-start row of every server log.
+    //    Cold-start snapshot is labelled 0 (sander asm.F90:334 hard-codes 0).
+    //    On restart we use the resumed local_step so the file lines up with
+    //    the existing on-disk filenames.
+    if(!outputs_opened_) { openOutputFiles(); outputs_opened_ = true; }
+    if(is_server_) {
+      const long lstep0 =
+        restarted_ ? (getStep() + step0_ - long(preparation_steps_)) : 0L;
+      writeSnapshot(lstep0);
+      writeParams();
+      snapshot_steps_.push_back(lstep0);
+      writeConvergence();
+    }
+
     first_calculate_ = false;
   }
 
-  const long local_step = getStep() + step0_;
+  const long local_step = getStep() + step0_ - long(preparation_steps_);
 
   // 1. Local metric sample (this step) — sander asm.F90:541.
   std::vector<double> M_now;
@@ -1385,13 +1428,23 @@ void ASM::calculate() {
   }
 
   // 4. Force-ramp / production accumulators.
-  if(local_step < start_step_) {
-    force_scale_ = std::min(1.0, double(local_step) / double(preparation_steps_));
+  //    Sander signed-step convention: local_step ∈ [-preparation_steps_, 0)
+  //    is preparation (force ramps 0→1, no .dat write), local_step ≥ 0 is
+  //    production. start_step_ optionally delays string evolution past the
+  //    start of production (default 0 = evolve immediately).
+  if(local_step < 0) {
+    const long md_step = local_step + long(preparation_steps_);
+    force_scale_ = std::min(1.0, double(md_step) / double(preparation_steps_));
     dz_tmp_last_.assign(ncv_, 0.0);
-    writeDat();
-    return;     // no accumulation during preparation
+    return;     // no .dat write, no accumulation during preparation
   }
   force_scale_ = 1.0;
+  if(local_step < start_step_) {
+    // Production but not yet evolving — full force, .dat row, no accumulation.
+    dz_tmp_last_.assign(ncv_, 0.0);
+    writeDat();
+    return;
+  }
 
   // dz_tmp: orthogonal displacement, sander asm.F90:557-559.
   //   tangent dot:   t = dCV · (Minv · n_vec)  using current Minv

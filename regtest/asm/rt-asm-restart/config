@@ -12,7 +12,9 @@ function plumed_regtest_before() {
   $mpi $valgrind $plumed driver --multi 2 --plumed plumed_phase1.dat \
     --ixyz trajectory.xyz --mc mc.dat > phase1_out 2> phase1_err
   # Move/remove phase-1 outputs that would otherwise collide with phase 2.
-  for f in colvar.0 colvar.1 0.dat 1.dat 0.string 2.string 4.string \
+  # Filenames match the action's 1-based per-replica .dat naming and the
+  # production-step-labelled snapshots (sander signed-step convention).
+  for f in colvar.0 colvar.1 1.dat 2.dat 0.string 2.string \
            node_positions.dat force_constants.dat convergence.dat; do
     rm -f "$f"
   done
