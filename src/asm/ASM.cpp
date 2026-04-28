@@ -1293,8 +1293,10 @@ void ASM::update() {
   if(first_calculate_) return;        // first call to update() comes before calculate's init
   const long local_step = getStep() + step0_ - long(preparation_steps_) + 1;
 
-  // --- string motion (sander asm.F90:592-602) ---
-  if(string_move_ && local_step >= start_step_
+  // local_step > 0 excludes a phantom local_step=0 production tick that
+  // has no sander equivalent (would otherwise fire string motion / REX /
+  // accumulators before any real production step has run).
+  if(string_move_ && local_step > 0 && local_step >= start_step_
      && long(local_step) % long(string_move_period_) == 0) {
 
     const double dt = getTimeStep();
@@ -1319,7 +1321,7 @@ void ASM::update() {
   }
 
   // --- internal replica exchange ---
-  if(REX_period_ > 0 && local_step >= start_step_
+  if(REX_period_ > 0 && local_step > 0 && local_step >= start_step_
      && local_step % long(REX_period_) == 0) {
     attemptReplicaExchange(local_step);
   }
@@ -1508,7 +1510,9 @@ void ASM::calculate() {
   }
   dpos_tmp *= K_l_[node_];
 
-  if(string_move_) {
+  // The phantom local_step=0 row is written for .dat row-count parity
+  // but must not contribute to the dz/dpos/dK accumulators.
+  if(string_move_ && local_step > 0) {
     for(unsigned k=0; k<ncv_; ++k) dz_[k] += dz_tmp[k];
     dpos_ += dpos_tmp;
     dK_   += dK_tmp;
