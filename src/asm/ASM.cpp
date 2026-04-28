@@ -1056,6 +1056,8 @@ void ASM::attemptReplicaExchange(long local_step) {
     rex_rng_seeded_ = true;
   }
 
+  const unsigned old_node = node_;
+
   // ---- Allgather per-rank packet --------------------------------------
   // packet layout (per rank): node_(double), cv[ncv], dz[ncv], dpos, dK,
   // mean_dx, mean_sigma2  →  1 + 2*ncv + 4 doubles.
@@ -1161,6 +1163,15 @@ void ASM::attemptReplicaExchange(long local_step) {
     is_terminal_ = (node_ == 0 || node_+1 == nnodes_);
     is_server_   = (node_ == 0);
     reparametrizeLinear();
+  }
+
+  // Re-route per-step .dat output to the current node's file. Sander does this
+  // unconditionally on every REX call (close at asm.F90:1044, assign_dat_file
+  // at 1093); we only act when this rank actually moved, since reopening the
+  // same file in append mode is otherwise a no-op.
+  if(node_ != old_node) {
+    if(dat_stream_.is_open()) dat_stream_.close();
+    openOutputFiles();
   }
 }
 
