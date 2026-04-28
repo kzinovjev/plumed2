@@ -1417,7 +1417,8 @@ void ASM::calculate() {
       writeSnapshot(lstep0);
       writeParams();
       snapshot_steps_.push_back(lstep0);
-      writeConvergence();
+      // No writeConvergence() at cold-start: the current string equals the
+      // snapshot just written, so every distance would be 0.
     }
 
     first_calculate_ = false;
