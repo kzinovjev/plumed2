@@ -1251,12 +1251,11 @@ void ASM::reparametrizeLinear() {
     for(auto& k : K_l_) k /= string_length_*string_length_;
   }
 
-  // Initialise pos_ to equal-step on first reparametrize; otherwise rescale
-  // proportionally to the new total length (sander asm.F90:1230-1235).
+  // First reparametrize: pos = L (the M-weighted arc lengths just built),
+  // making the linear-interpolation step below a no-op (j=node_, frac=1).
+  // Otherwise rescale proportionally to the new total length.
   if(first_reparametrize_) {
-    for(unsigned i=0; i<nnodes_; ++i) {
-      pos_[i] = string_length_ * double(i) / double(nnodes_-1);
-    }
+    for(unsigned i=0; i<nnodes_; ++i) pos_[i] = L_[i];
   } else if(string_move_ && pos_[nnodes_-1] > 0.0) {
     const double scale = string_length_ / pos_[nnodes_-1];
     for(unsigned i=0; i<nnodes_; ++i) pos_[i] *= scale;
