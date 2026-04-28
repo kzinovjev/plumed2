@@ -391,6 +391,12 @@ ASM::ASM(const ActionOptions& ao):
   parse("FORCE_KAPPA",    force_kappa_);
   parse("MAV_DAMP",       Mav_damp_);
 
+  // Convert user-input ps^-1 to AMBER internal time units (sander
+  // convention; force_gamma is intentionally not rescaled).
+  static constexpr double kSanderGammaScale = 2.3901e-3;
+  gamma_          *= kSanderGammaScale;
+  position_gamma_ *= kSanderGammaScale;
+
   // ---- replica exchange ----------------------------------------------
   parse("REX_PERIOD", REX_period_);
 
