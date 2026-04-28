@@ -211,7 +211,7 @@ private:
   void writeDat();                  // {node_}.dat — per-step append
   void writeSnapshot(long step);    // {step}.string — every output_period
   void writeParams() const;         // node_positions.dat, force_constants.dat
-  void writeConvergence() const;    // convergence.dat — full history of snapshot distances
+  void writeConvergence(long current_step) const;  // convergence.dat — distances of all snapshots up to current_step
 
   // checkpoint / restart
   std::string ckptPath() const;
@@ -871,10 +871,11 @@ void ASM::writeParams() const {
   kps << '\n';
 }
 
-void ASM::writeConvergence() const {
-  // For every previously-written snapshot, compute the metric-weighted
-  // average node-by-node distance from the current string and dump it.
-  // (sander write_convergence at asm.F90:927-968.)
+void ASM::writeConvergence(long current_step) const {
+  // Iterate output_period boundaries up to current_step and read each
+  // snapshot fresh from disk. Walking snapshot_steps_ would miss entries
+  // when is_server_ migrates between ranks across REX swaps — the on-disk
+  // .string set is the source of truth.
   const std::string fname = dir_ + "convergence.dat";
   std::ofstream out(fname);
   if(!out) {
@@ -883,8 +884,8 @@ void ASM::writeConvergence() const {
   }
   out.setf(std::ios::fixed); out.precision(5);
   std::vector<std::vector<double>> tmp(nnodes_, std::vector<double>(ncv_));
-  unsigned rows_written = 0;
-  for(long s : snapshot_steps_) {
+  const long period = long(output_period_);
+  for(long s = 0; s <= current_step; s += period) {
     const std::string sfname = dir_ + std::to_string(s) + ".string";
     std::ifstream in(sfname);
     if(!in) {
@@ -916,13 +917,8 @@ void ASM::writeConvergence() const {
     }
     out.width(8); out << s;
     out.width(15); out << dist << '\n';
-    ++rows_written;
   }
   out.flush();
-  if(rows_written == 0 && !snapshot_steps_.empty()) {
-    log.printf("WARNING: ASM convergence wrote 0 rows despite %zu snapshot(s) "
-               "in history\n", snapshot_steps_.size());
-  }
 }
 
 // ----- checkpoint / restart ----------------------------------------------
@@ -1328,7 +1324,7 @@ void ASM::update() {
       writeSnapshot(local_step);
       writeParams();
       snapshot_steps_.push_back(local_step);
-      writeConvergence();
+      writeConvergence(local_step);
     }
   }
 
