@@ -1119,7 +1119,9 @@ void ASM::attemptReplicaExchange(long local_step) {
   std::vector<int> accept(nnodes_, 0);          // accept[i] => pair (i, i+1)
   if(comm.Get_rank() == 0 && plumed.multi_sim_comm.Get_rank() == 0) {
     const long iter = local_step / long(REX_period_);
-    const unsigned phase = unsigned(iter & 1);  // 0: pairs (0,1),(2,3),...
+    // Lower-partner index alternates: iter odd -> (0,1),(2,3),... ;
+    // iter even -> (1,2),(3,4),... (matches sander parity in 0-based form).
+    const unsigned phase = unsigned(1 - (iter & 1));
     for(unsigned i=phase; i+1<nnodes_; i+=2) {
       const double Eii   = biasEnergyAt(i,   cv_by_node[i]);
       const double Ejj   = biasEnergyAt(i+1, cv_by_node[i+1]);
