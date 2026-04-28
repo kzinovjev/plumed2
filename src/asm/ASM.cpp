@@ -1494,8 +1494,10 @@ void ASM::calculate() {
   const double sigma2_target = 0.25 * delta * delta;
   double dpos_tmp = pos_target - tdot;
 
-  // First production step: seed the EMAs (sander asm.F90:567).
-  if(local_step == start_step_) {
+  // EMA reset / dK ramp-in must use the first real production step. With
+  // start_step_=0 (default) that is local_step=1, not local_step=0.
+  const long first_evol_step = std::max(1L, long(start_step_));
+  if(local_step == first_evol_step) {
     std::fill(dz_.begin(), dz_.end(), 0.0);
     dpos_ = dK_ = 0.0;
     mean_dx_     = 0.0;
@@ -1504,7 +1506,7 @@ void ASM::calculate() {
   mean_dx_     = 0.99*mean_dx_     + 0.01*dpos_tmp;
   mean_sigma2_ = 0.99*mean_sigma2_ + 0.01*dpos_tmp*dpos_tmp;
   double dK_tmp = 0.0;
-  if(local_step >= start_step_ + 100 && mean_sigma2_ > 0.0) {
+  if(local_step >= first_evol_step + 99 && mean_sigma2_ > 0.0) {
     dK_tmp = RT_/sigma2_target - RT_/mean_sigma2_
            + force_kappa_ * mean_dx_ * mean_dx_;
   }
