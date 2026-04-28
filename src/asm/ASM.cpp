@@ -180,7 +180,6 @@ private:
 
   // multi-replica state synchronisation
   void gatherStringAcrossReplicas();
-  void gatherKlAcrossReplicas();
   // Cross-replica average of Mav, inverted (sander asm.F90:388-390): used
   // as a single consistent metric for cold-start guess interpolation.
   void gatherMavMeanInverted(std::vector<double>& Mtmpinv) const;
@@ -588,48 +587,38 @@ void ASM::cvDiff(unsigned i, std::vector<double>& dCV) const {
 }
 
 void ASM::gatherStringAcrossReplicas() {
-  // Allgather string_[node_], pos_[node_], Mav_[node_] so every replica holds
-  // a complete picture. Done on rank-0-of-comm and Bcast within comm so that
-  // every MD rank within a replica observes the same state.
-  std::vector<double> sendS(ncv_), sendM(msize_);
-  for(unsigned k=0; k<ncv_; ++k) sendS[k] = string_[node_][k];
-  for(unsigned k=0; k<msize_; ++k) sendM[k] = Mav_[node_][k];
-  const double sendP = pos_[node_];
-  const double sendK = K_l_[node_];
+  // After REX, rank ≠ node — each rank embeds its own node_ at slot 0 of
+  // the send buffer so the receiver places the payload at the slot for
+  // the node, not the rank. K_l travels in the same pack to keep the
+  // remap atomic.
+  const unsigned pack_n = 1u + ncv_ + msize_ + 2u;
+  std::vector<double> sendbuf(pack_n);
+  unsigned p = 0;
+  sendbuf[p++] = double(node_);
+  for(unsigned k=0; k<ncv_; ++k)   sendbuf[p++] = string_[node_][k];
+  for(unsigned k=0; k<msize_; ++k) sendbuf[p++] = Mav_[node_][k];
+  sendbuf[p++] = pos_[node_];
+  sendbuf[p++] = K_l_[node_];
 
-  std::vector<double> recvS(ncv_*nnodes_, 0.0);
-  std::vector<double> recvM(msize_*nnodes_, 0.0);
-  std::vector<double> recvP(nnodes_, 0.0);
-  std::vector<double> recvK(nnodes_, 0.0);
-
+  std::vector<double> recvbuf(pack_n*nnodes_, 0.0);
   if(comm.Get_rank() == 0) {
-    plumed.multi_sim_comm.Allgather(sendS, recvS);
-    plumed.multi_sim_comm.Allgather(sendM, recvM);
-    plumed.multi_sim_comm.Allgather(&sendP, 1, recvP.data(), 1);
-    plumed.multi_sim_comm.Allgather(&sendK, 1, recvK.data(), 1);
+    plumed.multi_sim_comm.Allgather(sendbuf, recvbuf);
   }
-  comm.Bcast(recvS, 0);
-  comm.Bcast(recvM, 0);
-  comm.Bcast(recvP, 0);
-  comm.Bcast(recvK, 0);
+  comm.Bcast(recvbuf, 0);
 
+  for(unsigned r=0; r<nnodes_; ++r) {
+    const double* rp = &recvbuf[r*pack_n];
+    const unsigned n = unsigned(rp[0]);
+    if(n >= nnodes_) continue;
+    unsigned q = 1;
+    for(unsigned k=0; k<ncv_; ++k)   string_[n][k] = rp[q++];
+    for(unsigned k=0; k<msize_; ++k) Mav_[n][k]    = rp[q++];
+    pos_[n] = rp[q++];
+    K_l_[n] = rp[q++];
+  }
   for(unsigned i=0; i<nnodes_; ++i) {
-    for(unsigned k=0; k<ncv_; ++k) string_[i][k] = recvS[i*ncv_ + k];
-    for(unsigned k=0; k<msize_; ++k) Mav_[i][k] = recvM[i*msize_ + k];
-    pos_[i] = recvP[i];
-    K_l_[i] = recvK[i];
     invertPacked(Mav_[i], Minv_[i]);
   }
-}
-
-void ASM::gatherKlAcrossReplicas() {
-  std::vector<double> recv(nnodes_, 0.0);
-  const double sendK = K_l_[node_];
-  if(comm.Get_rank() == 0) {
-    plumed.multi_sim_comm.Allgather(&sendK, 1, recv.data(), 1);
-  }
-  comm.Bcast(recv, 0);
-  for(unsigned i=0; i<nnodes_; ++i) K_l_[i] = recv[i];
 }
 
 void ASM::gatherMavMeanInverted(std::vector<double>& Mtmpinv) const {
@@ -1314,7 +1303,10 @@ void ASM::update() {
     }
     K_l_[node_] += dK_ * inv_smp / force_gamma_;
 
-    gatherKlAcrossReplicas();
+    // No standalone K_l gather: reparametrizeLinear() below begins with a
+    // node-aware gatherStringAcrossReplicas() that packs K_l with everything
+    // else, so a rank-indexed K_l-only allgather would re-introduce the
+    // post-REX rank≠node bug.
     std::fill(dz_.begin(), dz_.end(), 0.0);
     dpos_ = 0.0;
     dK_   = 0.0;
