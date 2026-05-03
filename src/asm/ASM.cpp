@@ -1002,7 +1002,7 @@ void ASM::writeCheckpoint(long local_step) const {
   out.precision(15);
 
   out << "# ASM checkpoint \n";
-  out << "version 2\n";
+  out << "version 3\n";
   out << "local_step " << local_step << '\n';
   out << "nnodes "     << nnodes_    << '\n';
   out << "ncv "        << ncv_       << '\n';
@@ -1015,6 +1015,13 @@ void ASM::writeCheckpoint(long local_step) const {
   auto emit_scalar_row = [&](const std::vector<double>& row) {
     emit_row(row);
   };
+
+  // Rank -> node mapping at checkpoint time.
+  out << "rank_to_node\n";
+  std::vector<unsigned> rank_to_node(nnodes_);
+  for(unsigned i=0; i<nnodes_; ++i) rank_to_node[node_to_rank_[i]] = i;
+  for(unsigned r=0; r<nnodes_; ++r) { out.width(8); out << rank_to_node[r]; }
+  out << '\n';
 
   out << "string\n";
   for(unsigned i=0; i<nnodes_; ++i) emit_row(string_[i]);
@@ -1061,6 +1068,9 @@ void ASM::readCheckpoint() {
   std::vector<std::vector<double>> dz_full(nnodes_, std::vector<double>(ncv_, 0.0));
   std::vector<double> dpos_full(nnodes_, 0.0), dK_full(nnodes_, 0.0);
   std::vector<double> mdx_full (nnodes_, 0.0), ms2_full(nnodes_, 0.0);
+  // Initialise to nnodes_ (an out-of-range sentinel) so the validation
+  // below catches a missing or partial rank_to_node section.
+  std::vector<unsigned> rank_to_node_ck(nnodes_, nnodes_);
 
   std::string tag;
   long saved_local_step = 0;
@@ -1068,7 +1078,7 @@ void ASM::readCheckpoint() {
   auto fail_if_truncated = [&](const char* what) {
     error(std::string("ASM checkpoint: truncated '") + what + "' in " + fname);
   };
-  auto read_1d = [&](std::vector<double>& v, const char* what) {
+  auto read_1d = [&](auto& v, const char* what) {
     return [&, what]() {
       for(auto& x : v) if(!(in >> x)) fail_if_truncated(what);
     };
@@ -1085,6 +1095,7 @@ void ASM::readCheckpoint() {
     {"nnodes",      [&]{ in >> ck_nnodes;        }},
     {"ncv",         [&]{ in >> ck_ncv;           }},
     {"K_d",         [&]{ in >> K_d_;             }},
+    {"rank_to_node",read_1d(rank_to_node_ck, "rank_to_node")},
     {"string",      read_2d(string_,   "string")},
     {"Mav",         read_2d(Mav_,      "Mav")},
     {"pos",         read_1d(pos_,      "pos")},
@@ -1107,7 +1118,7 @@ void ASM::readCheckpoint() {
       std::string rest; std::getline(in, rest);   // unknown tag: skip line
     }
   }
-  if(version != 2) {
+  if(version != 3) {
     error("ASM checkpoint " + fname + " has unsupported version "
           + std::to_string(version));
   }
@@ -1117,6 +1128,24 @@ void ASM::readCheckpoint() {
           + ", expected " + std::to_string(nnodes_) + "/"
           + std::to_string(ncv_));
   }
+  // Validate rank_to_node is a permutation of [0, nnodes_).
+  std::vector<unsigned> seen(nnodes_, 0);
+  for(unsigned r=0; r<nnodes_; ++r) {
+    const unsigned n = rank_to_node_ck[r];
+    if(n >= nnodes_ || ++seen[n] > 1) {
+      error("ASM checkpoint " + fname + ": rank_to_node is not a valid "
+            "permutation of [0," + std::to_string(nnodes_) + ")");
+    }
+  }
+
+  // Restore this rank's node identity from the checkpoint, then pick
+  // accumulator slots by node
+  const unsigned my_msc_rank = node_;
+  node_        = rank_to_node_ck[my_msc_rank];
+  is_terminal_ = (node_ == 0 || node_ + 1 == nnodes_);
+  is_server_   = (node_ == 0);
+  for(unsigned r=0; r<nnodes_; ++r) node_to_rank_[rank_to_node_ck[r]] = r;
+
   // Pick this rank's accumulator slot.
   dz_          = dz_full [node_];
   dpos_        = dpos_full[node_];
