@@ -113,7 +113,7 @@ private:
 
   // -------- I/O ---------------------------------------------------------
   std::string dir_;
-  std::string ckpt_filename_;
+  std::string restart_filename_;      // file to read on RESTART YES
   std::ofstream dat_stream_;          // {node_}.dat — per-step append
   std::vector<long> snapshot_steps_;  // history for convergence.dat
   bool  first_calculate_ = true;
@@ -214,9 +214,17 @@ private:
   void writeConvergence(long current_step) const;  // convergence.dat — distances of all snapshots up to current_step
 
   // checkpoint / restart
-  std::string ckptPath() const;
   void writeCheckpoint(long local_step) const;
   void readCheckpoint();            // called from constructor when RESTART YES
+  // Node-aware Allgather of the rank-owned accumulators (dz, dpos, dK,
+  // mean_dx, mean_sigma2). Output arrays are indexed by node — required
+  // because rank != node after any REX swap.
+  void gatherAccumulatorsByNode(
+      std::vector<std::vector<double>>& dz_full,
+      std::vector<double>& dpos_full,
+      std::vector<double>& dK_full,
+      std::vector<double>& mdx_full,
+      std::vector<double>& ms2_full) const;
 
   // replica exchange
   std::vector<unsigned> node_to_rank_;   // global, consistent on all ranks
@@ -253,8 +261,9 @@ void ASM::registerKeywords(Keywords& keys) {
            "output directory for {node}.dat, {step}.string, parameter logs");
   keys.add("compulsory", "OUTPUT_PERIOD", "100",
            "stride (in MD steps) for writing snapshots and parameter logs");
-  keys.add("compulsory", "CHECKPOINT_FILE", "asm_state.ckpt",
-           "checkpoint file name (auto-suffixed with replica index when nnodes>1)");
+  keys.add("optional", "RESTART_FILE",
+           "checkpoint file to read on RESTART YES (relative paths are "
+           "resolved against DIR). Required when RESTART YES.");
   keys.add("optional", "CHECKPOINT_PERIOD",
            "stride for checkpoint writes (default = OUTPUT_PERIOD)");
 
@@ -366,13 +375,10 @@ ASM::ASM(const ActionOptions& ao):
   if(!dir_.empty() && dir_.back() != '/') dir_ += '/';
 
   parse("OUTPUT_PERIOD", output_period_);
-  parse("CHECKPOINT_FILE", ckpt_filename_);
+  parse("RESTART_FILE", restart_filename_);
   checkpoint_period_ = 0;          // sentinel for "not given"
   parse("CHECKPOINT_PERIOD", checkpoint_period_);
   if(checkpoint_period_ == 0) checkpoint_period_ = output_period_;
-  if(nnodes_ > 1) {
-    ckpt_filename_ += "." + std::to_string(node_);
-  }
 
   // ---- stage timing ----------------------------------------------------
   parse("PREPARATION_STEPS", preparation_steps_);
@@ -467,8 +473,11 @@ ASM::ASM(const ActionOptions& ao):
   log.printf("    CVs: %u; output dir: %s\n", ncv_, dir_.c_str());
   log.printf("    preparation_steps=%u, start_step=%ld, string_move_period=%u\n",
              preparation_steps_, start_step_, string_move_period_);
-  log.printf("    output_period=%u, checkpoint_file=%s, checkpoint_period=%u\n",
-             output_period_, ckpt_filename_.c_str(), checkpoint_period_);
+  log.printf("    output_period=%u, checkpoint_period=%u\n",
+             output_period_, checkpoint_period_);
+  if(getRestart()) {
+    log.printf("    restart from: %s\n", restart_filename_.c_str());
+  }
   log.printf("    REX_period=%u%s\n",
              REX_period_, REX_period_ == 0 ? " (disabled)" : "");
   log.printf("    gamma=%g, position_gamma=%g, force_gamma=%g, force_kappa=%g, Mav_damp=%g\n",
@@ -923,18 +932,64 @@ void ASM::writeConvergence(long current_step) const {
 
 // ----- checkpoint / restart ----------------------------------------------
 
-std::string ASM::ckptPath() const {
-  std::string p = ckpt_filename_;
-  if(!p.empty() && p[0] != '/') p = dir_ + p;
-  return p;
+void ASM::gatherAccumulatorsByNode(
+    std::vector<std::vector<double>>& dz_full,
+    std::vector<double>& dpos_full,
+    std::vector<double>& dK_full,
+    std::vector<double>& mdx_full,
+    std::vector<double>& ms2_full) const {
+  // Each rank stamps node_ into slot 0 so the receiver demultiplexes by
+  // node, not by rank — required because rank != node after any REX swap.
+  // Mirrors the accumulator-pack subset of attemptReplicaExchange.
+  const unsigned pack_n = 1u + ncv_ + 4u;
+  std::vector<double> sendbuf(pack_n);
+  unsigned p = 0;
+  sendbuf[p++] = double(node_);
+  for(unsigned k=0; k<ncv_; ++k) sendbuf[p++] = dz_[k];
+  sendbuf[p++] = dpos_;
+  sendbuf[p++] = dK_;
+  sendbuf[p++] = mean_dx_;
+  sendbuf[p++] = mean_sigma2_;
+
+  std::vector<double> recvbuf(pack_n*nnodes_, 0.0);
+  if(comm.Get_rank() == 0) {
+    plumed.multi_sim_comm.Allgather(sendbuf, recvbuf);
+  }
+  comm.Bcast(recvbuf, 0);
+
+  dz_full  .assign(nnodes_, std::vector<double>(ncv_, 0.0));
+  dpos_full.assign(nnodes_, 0.0);
+  dK_full  .assign(nnodes_, 0.0);
+  mdx_full .assign(nnodes_, 0.0);
+  ms2_full .assign(nnodes_, 0.0);
+  for(unsigned r=0; r<nnodes_; ++r) {
+    const double* rp = &recvbuf[r*pack_n];
+    const unsigned n = unsigned(rp[0]);
+    if(n >= nnodes_) continue;
+    unsigned q = 1;
+    for(unsigned k=0; k<ncv_; ++k) dz_full[n][k] = rp[q++];
+    dpos_full[n] = rp[q++];
+    dK_full  [n] = rp[q++];
+    mdx_full [n] = rp[q++];
+    ms2_full [n] = rp[q++];
+  }
 }
 
 void ASM::writeCheckpoint(long local_step) const {
-  // One file per replica, atomic-rename. Stores the *minimum* state needed
-  // to resume: derived quantities (Minv, B, n_vec, spline) are recomputed
-  // on restart by gather + reparametrize.
-  if(ckpt_filename_.empty()) return;
-  const std::string final_path = ckptPath();
+  // One file per cluster, step-labeled ({step}.ck), all-node,
+  // self-contained. Atomic-rename via *.ck.tmp → *.ck. Collective: every
+  // replica must enter to participate in the accumulator Allgather; the
+  // file itself is written only by the server. Cluster-wide string_, Mav_,
+  // pos_, K_l_ are already gathered (reparametrizeLinear's
+  // gatherStringAcrossReplicas keeps them in sync), so only the rank-owned
+  // accumulators need a fresh gather here.
+  std::vector<std::vector<double>> dz_full;
+  std::vector<double> dpos_full, dK_full, mdx_full, ms2_full;
+  gatherAccumulatorsByNode(dz_full, dpos_full, dK_full, mdx_full, ms2_full);
+
+  if(!is_server_) return;
+
+  const std::string final_path = dir_ + std::to_string(local_step) + ".ck";
   const std::string tmp_path   = final_path + ".tmp";
   std::ofstream out(tmp_path);
   if(!out) {
@@ -943,28 +998,36 @@ void ASM::writeCheckpoint(long local_step) const {
   }
   out.setf(std::ios::scientific);
   out.precision(15);
-  out << "# ASM checkpoint v1\n";
-  out << "version 1\n";
-  out << "local_step "   << local_step << '\n';
-  out << "nnodes "       << nnodes_    << '\n';
-  out << "ncv "          << ncv_       << '\n';
-  out << "node "         << node_      << '\n';
-  out << "K_l_local "    << K_l_local_ << '\n';
-  out << "pos "          << pos_[node_] << '\n';
-  out << "string";
-  for(unsigned k=0; k<ncv_; ++k) out << ' ' << string_[node_][k];
-  out << '\n';
-  out << "Mav";
-  for(unsigned k=0; k<msize_; ++k) out << ' ' << Mav_[node_][k];
-  out << '\n';
-  out << "dz";
-  for(unsigned k=0; k<ncv_; ++k) out << ' ' << dz_[k];
-  out << '\n';
-  out << "dpos "         << dpos_         << '\n';
-  out << "dK "           << dK_           << '\n';
-  out << "mean_dx "      << mean_dx_      << '\n';
-  out << "mean_sigma2 "  << mean_sigma2_  << '\n';
+
+  out << "# ASM checkpoint \n";
+  out << "version 2\n";
+  out << "local_step " << local_step << '\n';
+  out << "nnodes "     << nnodes_    << '\n';
+  out << "ncv "        << ncv_       << '\n';
+  out << "K_d "        << K_d_       << '\n';
+
+  auto emit_row = [&](const std::vector<double>& row) {
+    for(double v : row) { out.width(24); out << v; }
+    out << '\n';
+  };
+  auto emit_scalar_row = [&](const std::vector<double>& row) {
+    emit_row(row);
+  };
+
+  out << "string\n";
+  for(unsigned i=0; i<nnodes_; ++i) emit_row(string_[i]);
+  out << "Mav\n";
+  for(unsigned i=0; i<nnodes_; ++i) emit_row(Mav_[i]);
+  out << "pos\n";        emit_scalar_row(pos_);
+  out << "K_l\n";        emit_scalar_row(K_l_);
+  out << "dz\n";
+  for(unsigned i=0; i<nnodes_; ++i) emit_row(dz_full[i]);
+  out << "dpos\n";       emit_scalar_row(dpos_full);
+  out << "dK\n";         emit_scalar_row(dK_full);
+  out << "mean_dx\n";    emit_scalar_row(mdx_full);
+  out << "mean_sigma2\n";emit_scalar_row(ms2_full);
   out.close();
+
   std::error_code ec;
   std::filesystem::rename(tmp_path, final_path, ec);
   if(ec) {
@@ -974,26 +1037,37 @@ void ASM::writeCheckpoint(long local_step) const {
 }
 
 void ASM::readCheckpoint() {
-  // Read the minimum saved state into per-replica slots; the full set of
-  // arrays (other nodes' string/Mav/...) is filled by the cold-start
-  // gather chain that runs on first calculate().
-  const std::string fname = ckptPath();
+  // Every replica reads the same file independently. The file is fully
+  // deterministic, so no MPI gymnastics are needed. Rank-owned scalars are
+  // picked from slot [node_] of the parsed accumulator arrays.
+  if(restart_filename_.empty()) {
+    error("ASM RESTART YES requires RESTART_FILE=<path>.ck");
+  }
+  std::string fname = restart_filename_;
+  if(!fname.empty() && fname[0] != '/') fname = dir_ + fname;
   std::ifstream in(fname);
   if(!in) {
-    log.printf("WARNING: ASM RESTART requested but %s not found; starting cold\n",
-               fname.c_str());
-    return;
+    error("ASM RESTART: cannot open " + fname);
   }
-  // Defensive: pre-allocate dz_ since it's read into a vector member.
-  if(dz_.size() != ncv_) dz_.assign(ncv_, 0.0);
-  if(string_[node_].size() != ncv_) string_[node_].assign(ncv_, 0.0);
-  if(Mav_[node_].size() != msize_)  Mav_[node_]   .assign(msize_, 0.0);
+
+  // Pre-size cluster-wide buffers (the constructor already sized them, but
+  // be defensive — read order is independent of the assign ordering above).
+  string_.assign(nnodes_, std::vector<double>(ncv_, 0.0));
+  Mav_   .assign(nnodes_, std::vector<double>(msize_, 0.0));
+  pos_   .assign(nnodes_, 0.0);
+  K_l_   .assign(nnodes_, 0.0);
+  std::vector<std::vector<double>> dz_full(nnodes_, std::vector<double>(ncv_, 0.0));
+  std::vector<double> dpos_full(nnodes_, 0.0), dK_full(nnodes_, 0.0);
+  std::vector<double> mdx_full (nnodes_, 0.0), ms2_full(nnodes_, 0.0);
 
   std::string tag;
   long saved_local_step = 0;
-  unsigned ck_nnodes = 0, ck_ncv = 0, ck_node = 0, version = 0;
+  unsigned ck_nnodes = 0, ck_ncv = 0, version = 0;
+  auto fail_if_truncated = [&](const char* what) {
+    error(std::string("ASM checkpoint: truncated '") + what + "' in " + fname);
+  };
   while(in >> tag) {
-    if(tag.size() && tag[0] == '#') {        // skip comment lines
+    if(!tag.empty() && tag[0] == '#') {
       std::string rest; std::getline(in, rest);
       continue;
     }
@@ -1001,32 +1075,61 @@ void ASM::readCheckpoint() {
     else if (tag == "local_step")  in >> saved_local_step;
     else if (tag == "nnodes")      in >> ck_nnodes;
     else if (tag == "ncv")         in >> ck_ncv;
-    else if (tag == "node")        in >> ck_node;
-    else if (tag == "K_l_local")   in >> K_l_local_;
-    else if (tag == "pos")         in >> pos_[node_];
-    else if (tag == "string")      for(unsigned k=0; k<ncv_; ++k)   in >> string_[node_][k];
-    else if (tag == "Mav")         for(unsigned k=0; k<msize_; ++k) in >> Mav_[node_][k];
-    else if (tag == "dz")          for(unsigned k=0; k<ncv_; ++k)   in >> dz_[k];
-    else if (tag == "dpos")        in >> dpos_;
-    else if (tag == "dK")          in >> dK_;
-    else if (tag == "mean_dx")     in >> mean_dx_;
-    else if (tag == "mean_sigma2") in >> mean_sigma2_;
-    else { std::string rest; std::getline(in, rest); }   // unknown tag: skip line
+    else if (tag == "K_d")         in >> K_d_;
+    else if (tag == "string") {
+      for(unsigned i=0; i<nnodes_; ++i)
+        for(unsigned k=0; k<ncv_; ++k)
+          if(!(in >> string_[i][k])) fail_if_truncated("string");
+    } else if (tag == "Mav") {
+      for(unsigned i=0; i<nnodes_; ++i)
+        for(unsigned k=0; k<msize_; ++k)
+          if(!(in >> Mav_[i][k])) fail_if_truncated("Mav");
+    } else if (tag == "pos") {
+      for(unsigned i=0; i<nnodes_; ++i)
+        if(!(in >> pos_[i])) fail_if_truncated("pos");
+    } else if (tag == "K_l") {
+      for(unsigned i=0; i<nnodes_; ++i)
+        if(!(in >> K_l_[i])) fail_if_truncated("K_l");
+    } else if (tag == "dz") {
+      for(unsigned i=0; i<nnodes_; ++i)
+        for(unsigned k=0; k<ncv_; ++k)
+          if(!(in >> dz_full[i][k])) fail_if_truncated("dz");
+    } else if (tag == "dpos") {
+      for(unsigned i=0; i<nnodes_; ++i)
+        if(!(in >> dpos_full[i])) fail_if_truncated("dpos");
+    } else if (tag == "dK") {
+      for(unsigned i=0; i<nnodes_; ++i)
+        if(!(in >> dK_full[i])) fail_if_truncated("dK");
+    } else if (tag == "mean_dx") {
+      for(unsigned i=0; i<nnodes_; ++i)
+        if(!(in >> mdx_full[i])) fail_if_truncated("mean_dx");
+    } else if (tag == "mean_sigma2") {
+      for(unsigned i=0; i<nnodes_; ++i)
+        if(!(in >> ms2_full[i])) fail_if_truncated("mean_sigma2");
+    } else {
+      std::string rest; std::getline(in, rest);   // unknown tag: skip line
+    }
   }
-  if(version != 1) {
+  if(version != 2) {
     error("ASM checkpoint " + fname + " has unsupported version "
           + std::to_string(version));
   }
-  if(ck_nnodes != nnodes_ || ck_ncv != ncv_ || ck_node != node_) {
+  if(ck_nnodes != nnodes_ || ck_ncv != ncv_) {
     error("ASM checkpoint topology mismatch: file says nnodes="
           + std::to_string(ck_nnodes) + " ncv=" + std::to_string(ck_ncv)
-          + " node=" + std::to_string(ck_node) + ", expected "
-          + std::to_string(nnodes_) + "/" + std::to_string(ncv_) + "/"
-          + std::to_string(node_));
+          + ", expected " + std::to_string(nnodes_) + "/"
+          + std::to_string(ncv_));
   }
-  K_l_[node_] = K_l_local_;
+  // Pick this rank's accumulator slot.
+  dz_          = dz_full [node_];
+  dpos_        = dpos_full[node_];
+  dK_          = dK_full [node_];
+  mean_dx_     = mdx_full[node_];
+  mean_sigma2_ = ms2_full[node_];
+  K_l_local_   = K_l_[node_];
+
   // Pick step0_ so the first post-restart calculate (getStep()=0)
-  // reproduces saved_local_step under the local_step formula above.
+  // reproduces saved_local_step under the local_step formula.
   step0_ = saved_local_step + long(preparation_steps_) - 1;
   first_reparametrize_ = false;     // skip the equal-spacing pos initialiser
   restarted_ = true;                // skip cold-start metric/string init in calculate()
@@ -1413,20 +1516,24 @@ void ASM::calculate() {
     }
     updateBLocal();
 
-    // 5. Open output files and write the cold-start row of every server log.
-    //    Cold-start snapshot is labelled 0 (sander asm.F90:334 hard-codes 0).
-    //    On restart we use the resumed local_step so the file lines up with
-    //    the existing on-disk filenames.
+    // Open output files and write the cold-start row of every server log.
+    // Cold-start snapshot is labelled 0.
+    // On restart we use the resumed local_step so the file lines up with
+    // the existing on-disk filenames.
     if(!outputs_opened_) { openOutputFiles(); outputs_opened_ = true; }
+    const long lstep0 =
+      restarted_ ? (getStep() + step0_ - long(preparation_steps_) + 1) : 0L;
     if(is_server_) {
-      const long lstep0 =
-        restarted_ ? (getStep() + step0_ - long(preparation_steps_) + 1) : 0L;
       writeSnapshot(lstep0);
       writeParams();
       snapshot_steps_.push_back(lstep0);
       // No writeConvergence() at cold-start: the current string equals the
       // snapshot just written, so every distance would be 0.
     }
+    // Cold-start 0.ck
+    // Skipped on restart: the file we just read from would only
+    // be re-emitted.
+    if(!restarted_) writeCheckpoint(0);
 
     first_calculate_ = false;
   }

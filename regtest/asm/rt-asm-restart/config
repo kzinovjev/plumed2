@@ -14,6 +14,7 @@ function plumed_regtest_before() {
   # Move/remove phase-1 outputs that would otherwise collide with phase 2.
   # Filenames match the action's 1-based per-replica .dat naming and the
   # production-step-labelled snapshots (sander signed-step convention).
+  # Phase-1 .ck files are kept on disk: phase 2 reads RESTART_FILE=2.ck.
   for f in colvar.0 colvar.1 1.dat 2.dat 0.string 2.string \
            node_positions.dat force_constants.dat convergence.dat; do
     rm -f "$f"
