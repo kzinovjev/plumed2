@@ -40,7 +40,9 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace PLMD {
@@ -1066,46 +1068,41 @@ void ASM::readCheckpoint() {
   auto fail_if_truncated = [&](const char* what) {
     error(std::string("ASM checkpoint: truncated '") + what + "' in " + fname);
   };
+  auto read_1d = [&](std::vector<double>& v, const char* what) {
+    return [&, what]() {
+      for(auto& x : v) if(!(in >> x)) fail_if_truncated(what);
+    };
+  };
+  auto read_2d = [&](std::vector<std::vector<double>>& m, const char* what) {
+    return [&, what]() {
+      for(auto& row : m) for(auto& x : row)
+        if(!(in >> x)) fail_if_truncated(what);
+    };
+  };
+  const std::unordered_map<std::string, std::function<void()>> handlers = {
+    {"version",     [&]{ in >> version;          }},
+    {"local_step",  [&]{ in >> saved_local_step; }},
+    {"nnodes",      [&]{ in >> ck_nnodes;        }},
+    {"ncv",         [&]{ in >> ck_ncv;           }},
+    {"K_d",         [&]{ in >> K_d_;             }},
+    {"string",      read_2d(string_,   "string")},
+    {"Mav",         read_2d(Mav_,      "Mav")},
+    {"pos",         read_1d(pos_,      "pos")},
+    {"K_l",         read_1d(K_l_,      "K_l")},
+    {"dz",          read_2d(dz_full,   "dz")},
+    {"dpos",        read_1d(dpos_full, "dpos")},
+    {"dK",          read_1d(dK_full,   "dK")},
+    {"mean_dx",     read_1d(mdx_full,  "mean_dx")},
+    {"mean_sigma2", read_1d(ms2_full,  "mean_sigma2")},
+  };
   while(in >> tag) {
     if(!tag.empty() && tag[0] == '#') {
       std::string rest; std::getline(in, rest);
       continue;
     }
-    if      (tag == "version")     in >> version;
-    else if (tag == "local_step")  in >> saved_local_step;
-    else if (tag == "nnodes")      in >> ck_nnodes;
-    else if (tag == "ncv")         in >> ck_ncv;
-    else if (tag == "K_d")         in >> K_d_;
-    else if (tag == "string") {
-      for(unsigned i=0; i<nnodes_; ++i)
-        for(unsigned k=0; k<ncv_; ++k)
-          if(!(in >> string_[i][k])) fail_if_truncated("string");
-    } else if (tag == "Mav") {
-      for(unsigned i=0; i<nnodes_; ++i)
-        for(unsigned k=0; k<msize_; ++k)
-          if(!(in >> Mav_[i][k])) fail_if_truncated("Mav");
-    } else if (tag == "pos") {
-      for(unsigned i=0; i<nnodes_; ++i)
-        if(!(in >> pos_[i])) fail_if_truncated("pos");
-    } else if (tag == "K_l") {
-      for(unsigned i=0; i<nnodes_; ++i)
-        if(!(in >> K_l_[i])) fail_if_truncated("K_l");
-    } else if (tag == "dz") {
-      for(unsigned i=0; i<nnodes_; ++i)
-        for(unsigned k=0; k<ncv_; ++k)
-          if(!(in >> dz_full[i][k])) fail_if_truncated("dz");
-    } else if (tag == "dpos") {
-      for(unsigned i=0; i<nnodes_; ++i)
-        if(!(in >> dpos_full[i])) fail_if_truncated("dpos");
-    } else if (tag == "dK") {
-      for(unsigned i=0; i<nnodes_; ++i)
-        if(!(in >> dK_full[i])) fail_if_truncated("dK");
-    } else if (tag == "mean_dx") {
-      for(unsigned i=0; i<nnodes_; ++i)
-        if(!(in >> mdx_full[i])) fail_if_truncated("mean_dx");
-    } else if (tag == "mean_sigma2") {
-      for(unsigned i=0; i<nnodes_; ++i)
-        if(!(in >> ms2_full[i])) fail_if_truncated("mean_sigma2");
+    auto it = handlers.find(tag);
+    if(it != handlers.end()) {
+      it->second();
     } else {
       std::string rest; std::getline(in, rest);   // unknown tag: skip line
     }
