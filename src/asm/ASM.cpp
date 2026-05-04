@@ -195,6 +195,9 @@ private:
 
   // multi-replica state synchronisation
   void gatherStringAcrossReplicas();
+  // Each replica computes B only for its own node in updateBLocal; the
+  // REX bias-energy probe needs B[i] for every i
+  void gatherBAcrossReplicas();
   // Cross-replica average of Mav, inverted: used as a single consistent
   // metric for cold-start guess interpolation.
   void gatherMavMeanInverted(std::vector<double>& Mtmpinv) const;
@@ -670,6 +673,31 @@ void ASM::gatherStringAcrossReplicas() {
   }
   for(unsigned i=0; i<nnodes; ++i) {
     invertPacked(nodes[i].Mav, nodes[i].Minv);
+  }
+}
+
+void ASM::gatherBAcrossReplicas() {
+  // Per-rank packet: node(double) + B[msize]. Each replica owns one
+  // node's B (computed in updateBLocal); broadcast so biasEnergyAt(i,.)
+  // works for every i during attemptReplicaExchange. Without this the
+  // four-energy probe sees B[i]=0 for every node not owned by rank 0
+  // of multi_sim_comm and effectively always-accepts those swaps.
+  const unsigned pack_n = 1u + msize;
+  std::vector<double> sendbuf(pack_n);
+  sendbuf[0] = double(node);
+  for(unsigned k=0; k<msize; ++k) sendbuf[1+k] = nodes[node].B[k];
+
+  std::vector<double> recvbuf(pack_n*nnodes, 0.0);
+  if(comm.Get_rank() == 0) {
+    plumed.multi_sim_comm.Allgather(sendbuf, recvbuf);
+  }
+  comm.Bcast(recvbuf, 0);
+
+  for(unsigned r=0; r<nnodes; ++r) {
+    const double* rp = &recvbuf[r*pack_n];
+    const unsigned n = unsigned(rp[0]);
+    if(n >= nnodes) continue;
+    for(unsigned k=0; k<msize; ++k) nodes[n].B[k] = rp[1+k];
   }
 }
 
@@ -1474,6 +1502,7 @@ void ASM::reparametrizeLinear() {
   splineTangentLocal();         // override with spline derivative if available
   normaliseTangentLocal();
   updateBLocal();
+  gatherBAcrossReplicas();
   toBoxLocalNode();
 
   first_reparametrize = false;

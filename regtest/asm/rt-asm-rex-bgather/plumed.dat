@@ -1,0 +1,26 @@
+# Regression test for the cross-replica B-matrix gather. The four-energy
+# REX probability inside attemptReplicaExchange reads nodes[i].B for every
+# node i (not just the rank's own); updateBLocal only refreshes the local
+# rank's slot, so it must be followed by an Allgather. Without that,
+# nodes[i].B == 0 for every i not owned by rank 0 of multi_sim_comm and
+# dE silently collapses to zero on most pairs (always accept), corrupting
+# the post-REX dynamics.
+#
+# To expose the bug we drive each replica with a slightly different CV
+# input via a per-replica CONSTANT shift. That breaks the symmetry that
+# otherwise makes sander's four-energy form vanish identically in
+# plumed driver (where every rank reads the same trajectory). With B
+# correctly gathered the swap probability is the real exponential; with
+# B==0 it collapses to 1 and pair (1,2) is always accepted, producing a
+# different node trajectory.
+d1: DISTANCE ATOMS=1,2
+d2: DISTANCE ATOMS=3,4
+# Shift is set large enough that the missing Eji-Ejj terms in the buggy
+# four-energy probability are ≫ RT. That pushes the buggy always-accept
+# decision and the correct mostly-reject decision onto opposite sides of
+# the random roll, so this regtest's reference output (captured against
+# the fixed kernel) differs from what a buggy build produces.
+shift: CONSTANT VALUES=@replicas:0.0,1.0,2.0
+d1s: COMBINE ARG=d1,shift COEFFICIENTS=1.0,1.0 PERIODIC=NO
+asm: ASM ARG=d1s,d2 ATOMS=1-6 PREPARATION_STEPS=1 STRING_MOVE_PERIOD=1 OUTPUT_PERIOD=1 REX_PERIOD=1 FORCE_CONSTANT_L=10 FORCE_CONSTANT_D=5 GAMMA=1 POSITION_GAMMA=1 FORCE_GAMMA=1 FORCE_KAPPA=1 MAV_DAMP=0.1 DIR=./ TEMP=300 CHECKPOINT_PERIOD=2
+PRINT ARG=asm.bias FILE=colvar FMT=%8.4f STRIDE=1
