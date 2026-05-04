@@ -121,7 +121,7 @@ private:
   // -------- I/O ---------------------------------------------------------
   std::string dir;
   std::string restart_filename;      // file to read on RESTART YES
-  std::ofstream dat_stream;          // {node}.dat — per-step append
+  OFile dat_stream;                  // {node}.dat — per-step append
   std::vector<long> snapshot_steps;  // history for convergence.dat
   // Lifecycle: ColdStart from construction, Restarted after readCheckpoint(),
   // Production once the first calculate() has run its init block.
@@ -220,11 +220,11 @@ private:
   void openOutputFiles();
   void writeDat();                  // {node}.dat — per-step append
   void writeSnapshot(long step);    // {step}.string — every output_period
-  void writeParams() const;         // node_positions.dat, force_constants.dat
-  void writeConvergence(long current_step) const;  // convergence.dat — distances of all snapshots up to current_step
+  void writeParams();               // node_positions.dat, force_constants.dat
+  void writeConvergence(long current_step);  // convergence.dat — distances of all snapshots up to current_step
 
   // checkpoint / restart
-  void writeCheckpoint(long local_step) const;
+  void writeCheckpoint(long local_step);
   void readCheckpoint();            // called from constructor when RESTART YES
   // Node-aware Allgather of the rank-owned accumulators (dz, dpos, dK,
   // mean_dx, mean_sigma2). Output arrays are indexed by node — required
@@ -850,31 +850,36 @@ void ASM::openOutputFiles() {
   // 1-based on-disk filename (1.dat .. N.dat). Internal C++ indexing
   // remains 0-based; only the file name is offset.
   const std::string fname = dir + std::to_string(node + 1) + ".dat";
-  // Append mode so a restart continues an existing trajectory.
-  dat_stream.open(fname, std::ios::out | std::ios::app);
+  // Append unconditionally so a cold-start truncate-create or a RESTART YES
+  // append both line up with how the file is laid out.
+  dat_stream.link(*this);
+  dat_stream.enforceSuffix("");        // node identity is already in the path
+  dat_stream.enforceRestart();         // force append-mode regardless of RESTART
+  dat_stream.open(fname);
   if(!dat_stream) error("ASM: failed to open " + fname + " for output");
-  dat_stream.setf(std::ios::scientific);
-  dat_stream.precision(5);
 }
 
 void ASM::writeDat() {
   // Per-step trajectory: CVs, this node's string position, dz_tmp/gamma.
-  if(!dat_stream) return;
-  auto fmt = [&](double v) { dat_stream.width(15); dat_stream << v; };
-  for(unsigned k=0; k<ncv; ++k) fmt(getArgument(k));
-  for(unsigned k=0; k<ncv; ++k) fmt(path[node][k]);
-  for(unsigned k=0; k<ncv; ++k) fmt(gamma > 0.0 ? dz_tmp_last[k] / gamma : 0.0);
-  dat_stream << '\n';
+  if(!dat_stream.isOpen()) return;
+  for(unsigned k=0; k<ncv; ++k) dat_stream.printf("%15.5e", getArgument(k));
+  for(unsigned k=0; k<ncv; ++k) dat_stream.printf("%15.5e", path[node][k]);
+  for(unsigned k=0; k<ncv; ++k)
+    dat_stream.printf("%15.5e", gamma > 0.0 ? dz_tmp_last[k] / gamma : 0.0);
+  dat_stream.printf("\n");
   dat_stream.flush();
 }
 
 void ASM::writeSnapshot(long step) {
   // {step}.string: all node coordinates in the spline-continuous form.
-  // Server-only.
+  // Server-only. The file is re-truncated on every call (the action may
+  // re-emit the same step on a restart whose checkpoint matches a prior
+  // output_period boundary), so OFile's restart-aware append semantics do
+  // not fit; std::ofstream is the right tool here.
   toContinuousString();
   const std::string fname = dir + std::to_string(step) + ".string";
   std::ofstream out(fname);
-  if(!out) { log.printf("WARNING: ASM cannot open %s\n", fname.c_str()); return; }
+  if(!out) error("ASM: cannot open " + fname);
   out.setf(std::ios::scientific);
   out.precision(5);
   // One row per node, CVs across the row.
@@ -890,33 +895,37 @@ void ASM::writeSnapshot(long step) {
   }
 }
 
-void ASM::writeParams() const {
+void ASM::writeParams() {
   // node_positions.dat & force_constants.dat — appended every output_period.
   const std::string n_fname = dir + "node_positions.dat";
   const std::string k_fname = dir + "force_constants.dat";
-  std::ofstream nps(n_fname, std::ios::out | std::ios::app);
-  std::ofstream kps(k_fname, std::ios::out | std::ios::app);
-  if(!nps || !kps) return;
-  nps.setf(std::ios::fixed); nps.precision(5);
-  kps.setf(std::ios::fixed); kps.precision(5);
+  OFile nps, kps;
+  nps.link(*this);
+  nps.enforceSuffix("");
+  nps.enforceRestart();                // append every call
+  nps.open(n_fname);
+  if(!nps) error("ASM: cannot open " + n_fname);
+  kps.link(*this);
+  kps.enforceSuffix("");
+  kps.enforceRestart();
+  kps.open(k_fname);
+  if(!kps) error("ASM: cannot open " + k_fname);
   const double denom = (pos[nnodes-1] != 0.0) ? pos[nnodes-1] : 1.0;
-  for(unsigned i=0; i<nnodes; ++i) { nps.width(15); nps << pos[i] / denom; }
-  nps << '\n';
-  for(unsigned i=0; i<nnodes; ++i) { kps.width(15); kps << K_l[i]; }
-  kps << '\n';
+  for(unsigned i=0; i<nnodes; ++i) nps.printf("%15.5f", pos[i] / denom);
+  nps.printf("\n");
+  for(unsigned i=0; i<nnodes; ++i) kps.printf("%15.5f", K_l[i]);
+  kps.printf("\n");
 }
 
-void ASM::writeConvergence(long current_step) const {
+void ASM::writeConvergence(long current_step) {
   // Iterate output_period boundaries up to current_step and read each
   // snapshot fresh from disk. Walking snapshot_steps would miss entries
   // when is_server migrates between ranks across REX swaps — the on-disk
-  // .string set is the source of truth.
+  // .string set is the source of truth. The file is rewritten on each
+  // call, so OFile's restart-aware append semantics do not fit.
   const std::string fname = dir + "convergence.dat";
   std::ofstream out(fname);
-  if(!out) {
-    log.printf("WARNING: ASM cannot open %s for write\n", fname.c_str());
-    return;
-  }
+  if(!out) error("ASM: cannot open " + fname);
   out.setf(std::ios::fixed); out.precision(5);
   std::vector<std::vector<double>> tmp(nnodes, std::vector<double>(ncv));
   const long period = long(output_period);
@@ -1001,7 +1010,7 @@ void ASM::gatherAccumulatorsByNode(
   }
 }
 
-void ASM::writeCheckpoint(long local_step) const {
+void ASM::writeCheckpoint(long local_step) {
   // One file per cluster, step-labeled ({step}.ck), all-node,
   // self-contained. Atomic-rename via *.ck.tmp → *.ck. Collective: every
   // replica must enter to participate in the accumulator Allgather; the
@@ -1015,13 +1024,12 @@ void ASM::writeCheckpoint(long local_step) const {
 
   if(!is_server) return;
 
+  // The .ck.tmp file is freshly truncated on every call; OFile's
+  // restart-aware append semantics do not fit here.
   const std::string final_path = dir + std::to_string(local_step) + ".ck";
   const std::string tmp_path   = final_path + ".tmp";
   std::ofstream out(tmp_path);
-  if(!out) {
-    log.printf("WARNING: ASM cannot open checkpoint %s\n", tmp_path.c_str());
-    return;
-  }
+  if(!out) error("ASM: cannot open checkpoint " + tmp_path);
   out.setf(std::ios::scientific);
   out.precision(15);
 
@@ -1330,7 +1338,7 @@ void ASM::attemptReplicaExchange(long local_step) {
   // Re-route per-step .dat output to the current node's file when this rank
   // actually moved. Reopening the same file in append mode would be a no-op.
   if(node != old_node) {
-    if(dat_stream.is_open()) dat_stream.close();
+    if(dat_stream.isOpen()) dat_stream.close();
     openOutputFiles();
   }
 }
