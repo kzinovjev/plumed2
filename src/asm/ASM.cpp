@@ -427,9 +427,10 @@ ASM::ASM(const ActionOptions& ao):
   // ---- flags (parsed as YES/NO strings) ------------------------------
   auto parseYesNo = [&](const char* key, bool& dst) {
     std::string s; parse(key, s);
-    if(s == "YES" || s == "yes" || s == "Yes" || s == "true" || s == "TRUE" || s == "1") dst = true;
-    else if(s == "NO" || s == "no" || s == "No" || s == "false" || s == "FALSE" || s == "0") dst = false;
-    else error(std::string("unrecognised YES/NO value for ") + key + ": '" + s + "'");
+    if(s == "YES")      dst = true;
+    else if(s == "NO")  dst = false;
+    else error(std::string("unrecognised YES/NO value for ") + key
+               + ": '" + s + "' (expected YES or NO)");
   };
   parseYesNo("STRING_MOVE",    string_move);
   parseYesNo("FIX_ENDS",       fix_ends);
