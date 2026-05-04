@@ -236,12 +236,22 @@ private:
       std::vector<double>& mdx_full,
       std::vector<double>& ms2_full) const;
 
+  // first-call init split out from calculate()
+  void initOnFirstCall(bool from_restart);
+
   // replica exchange
   std::vector<unsigned> node_to_rank;   // global, consistent on all ranks
   Random rex_rng;
   bool   rex_rng_seeded = false;
   void attemptReplicaExchange(long local_step);
   double biasEnergyAt(unsigned node_idx, const std::vector<double>& cv_at_partner) const;
+  void applyRexSwaps(const std::vector<int>& accept,
+                     const std::vector<std::vector<double>>& dz_by_node,
+                     const std::vector<double>& dpos_by_node,
+                     const std::vector<double>& dK_by_node,
+                     const std::vector<double>& mdx_by_node,
+                     const std::vector<double>& ms2_by_node,
+                     bool& any_swap);
 
   // first-call guard for one-time work in reparametrizeLinear
   bool first_reparametrize = true;
@@ -1189,6 +1199,42 @@ double ASM::biasEnergyAt(unsigned node_idx,
 
 // ----- replica exchange ---------------------------------------------------
 
+void ASM::applyRexSwaps(const std::vector<int>& accept,
+                        const std::vector<std::vector<double>>& dz_by_node,
+                        const std::vector<double>& dpos_by_node,
+                        const std::vector<double>& dK_by_node,
+                        const std::vector<double>& mdx_by_node,
+                        const std::vector<double>& ms2_by_node,
+                        bool& any_swap) {
+  // node_to_rank[] indexes the multi_sim_comm rank that currently owns each
+  // node. After every accepted swap the mapping is mirrored on every rank.
+  any_swap = false;
+  const unsigned my_msc_rank = plumed.multi_sim_comm.Get_rank();
+  for(unsigned i=0; i+1<nnodes; ++i) {
+    if(!accept[i]) continue;
+    any_swap = true;
+    const bool i_am_lower = (my_msc_rank == node_to_rank[i]);
+    const bool i_am_upper = (my_msc_rank == node_to_rank[i+1]);
+    if(i_am_lower) {
+      for(unsigned k=0; k<ncv; ++k) dz[k] = dz_by_node[i+1][k];
+      dpos         = dpos_by_node[i+1];
+      dK           = dK_by_node[i+1];
+      mean_dx      = mdx_by_node[i+1];
+      mean_sigma2  = ms2_by_node[i+1];
+      node         = i+1;
+    } else if(i_am_upper) {
+      for(unsigned k=0; k<ncv; ++k) dz[k] = dz_by_node[i][k];
+      dpos         = dpos_by_node[i];
+      dK           = dK_by_node[i];
+      mean_dx      = mdx_by_node[i];
+      mean_sigma2  = ms2_by_node[i];
+      node         = i;
+    }
+    // Update the global mapping the same way on every rank.
+    std::swap(node_to_rank[i], node_to_rank[i+1]);
+  }
+}
+
 void ASM::attemptReplicaExchange(long local_step) {
   if(REX_period == 0 || nnodes < 2) return;
 
@@ -1251,8 +1297,8 @@ void ASM::attemptReplicaExchange(long local_step) {
     const long iter = local_step / long(REX_period);
     // Lower-partner index alternates: iter odd -> (0,1),(2,3),... ;
     // iter even -> (1,2),(3,4),...
-    const unsigned phase = unsigned(1 - (iter & 1));
-    for(unsigned i=phase; i+1<nnodes; i+=2) {
+    const unsigned parity = unsigned(1 - (iter & 1));
+    for(unsigned i=parity; i+1<nnodes; i+=2) {
       const double Eii   = biasEnergyAt(i,   cv_by_node[i]);
       const double Ejj   = biasEnergyAt(i+1, cv_by_node[i+1]);
       const double Eij   = biasEnergyAt(i,   cv_by_node[i+1]);
@@ -1268,35 +1314,8 @@ void ASM::attemptReplicaExchange(long local_step) {
 
   // ---- Apply accepted swaps -------------------------------------------
   bool any_swap = false;
-  for(unsigned i=0; i+1<nnodes; ++i) {
-    if(!accept[i]) continue;
-    any_swap = true;
-    // Determine if THIS rank is the lower or upper partner of (i, i+1).
-    // "This rank" comparison goes via plumed.multi_sim_comm's rank since
-    // node_to_rank[i] was filled from that side of the gather.
-    const unsigned my_msc_rank = plumed.multi_sim_comm.Get_rank();
-    const bool i_am_lower = (my_msc_rank == node_to_rank[i]);
-    const bool i_am_upper = (my_msc_rank == node_to_rank[i+1]);
-
-    if(i_am_lower) {
-      for(unsigned k=0; k<ncv; ++k) dz[k] = dz_by_node[i+1][k];
-      dpos         = dpos_by_node[i+1];
-      dK           = dK_by_node[i+1];
-      mean_dx      = mdx_by_node[i+1];
-      mean_sigma2  = ms2_by_node[i+1];
-      node         = i+1;
-    } else if(i_am_upper) {
-      for(unsigned k=0; k<ncv; ++k) dz[k] = dz_by_node[i][k];
-      dpos         = dpos_by_node[i];
-      dK           = dK_by_node[i];
-      mean_dx      = mdx_by_node[i];
-      mean_sigma2  = ms2_by_node[i];
-      node         = i;
-    }
-
-    // Update the global mapping the same way on every rank.
-    std::swap(node_to_rank[i], node_to_rank[i+1]);
-  }
+  applyRexSwaps(accept, dz_by_node, dpos_by_node, dK_by_node,
+                mdx_by_node, ms2_by_node, any_swap);
 
   // Refresh B/n_vec/Minv for the new node on every rank, even those
   // that weren't part of a swap, because reparametrizeLinear is a collective
@@ -1484,93 +1503,95 @@ void ASM::update() {
   }
 }
 
+void ASM::initOnFirstCall(bool from_restart) {
+  cacheMasses();
+
+  // 1. Initial metric sample.
+  //    On restart we already have a saved Mav from the checkpoint and
+  //    must not overwrite it with a one-step sample. With read_M and a
+  //    guess file holding Minv we seed Mav from the file's per-node Minv.
+  if(read_M && !guess_Minv.empty() && !from_restart) {
+    // Pick the guess-Minv slot matching this node — interpolate when the
+    // guess has a different point count, otherwise direct copy.
+    if(guess_Minv.size() == nnodes) {
+      Minv[node] = guess_Minv[node];
+    } else {
+      // For the metric, "linear interpolation between Minv tensors" is a
+      // crude but standard fallback — picks the nearest guess point.
+      const unsigned src_idx = (node * (guess_Minv.size()-1)) / (nnodes-1);
+      Minv[node] = guess_Minv[src_idx];
+    }
+    invertPacked(Minv[node], Mav[node]);
+  } else {
+    if(!read_M && !from_restart) buildLocalMetric(Mav[node]);
+    invertPacked(Mav[node], Minv[node]);
+  }
+
+  // 2. Initial string positions:
+  //    - on restart, path[node] was loaded from the checkpoint.
+  //    - with a guess file: each replica seeds path[node] from the
+  //      guess (interpolated to nnodes if the file has a different point
+  //      count). The interpolation metric is inv(mean_replicas(Mav)) so
+  //      every replica produces the same resampled string.
+  //    - otherwise: each replica's current ARG values become its node.
+  if(!from_restart) {
+    if(!guess_string.empty()) {
+      std::vector<std::vector<double>> resampled(nnodes,
+                                                 std::vector<double>(ncv, 0.0));
+      if(guess_string.size() == nnodes) {
+        resampled = guess_string;
+      } else {
+        std::vector<double> Mtmpinv;
+        gatherMavMeanInverted(Mtmpinv);
+        interpolateLinear(guess_string, resampled, Mtmpinv);
+      }
+      path[node] = resampled[node];
+    } else {
+      initStringFromCurrentCV();
+    }
+  }
+
+  // 3. Sync, build arclengths + tangents + B.
+  reparametrizeLinear();
+
+  // 4. Default K_l auto-tuning if user did not supply force_constant_l.
+  //    Must run before writeParams so force_constants.dat row 0 reflects
+  //    the actual initial K_l, and before updateBLocal so B is consistent.
+  if(K_l_local <= 0.0) {
+    // K_l = RT / (Δ/2)^2 where Δ is the inter-node spacing.
+    const double delta = string_length / double(nnodes-1);
+    const double half_delta = 0.5 * delta;
+    K_l_local = RT / (half_delta * half_delta);
+    for(auto& k : K_l) k = K_l_local;
+  }
+  if(K_d <= 0.0) {
+    K_d = 0.5 * K_l_local;
+  }
+  updateBLocal();
+
+  // Open output files and write the cold-start row of every server log.
+  // Cold-start snapshot is labelled 0.
+  // On restart we use the resumed local_step so the file lines up with
+  // the existing on-disk filenames.
+  if(!outputs_opened) { openOutputFiles(); outputs_opened = true; }
+  const long lstep0 =
+    from_restart ? (getStep() + step0 - long(preparation_steps) + 1) : 0L;
+  if(is_server) {
+    writeSnapshot(lstep0);
+    writeParams();
+    snapshot_steps.push_back(lstep0);
+    // No writeConvergence() at cold-start: the current string equals the
+    // snapshot just written, so every distance would be 0.
+  }
+  // Cold-start 0.ck
+  // Skipped on restart: the file we just read from would only
+  // be re-emitted.
+  if(!from_restart) writeCheckpoint(0);
+}
+
 void ASM::calculate() {
   if(phase != Phase::Production) {
-    const bool from_restart = (phase == Phase::Restarted);
-    cacheMasses();
-
-    // 1. Initial metric sample.
-    //    On restart we already have a saved Mav from the checkpoint and
-    //    must not overwrite it with a one-step sample. With read_M and a
-    //    guess file holding Minv we seed Mav from the file's per-node Minv.
-    if(read_M && !guess_Minv.empty() && !from_restart) {
-      // Pick the guess-Minv slot matching this node — interpolate when the
-      // guess has a different point count, otherwise direct copy.
-      if(guess_Minv.size() == nnodes) {
-        Minv[node] = guess_Minv[node];
-      } else {
-        // For the metric, "linear interpolation between Minv tensors" is a
-        // crude but standard fallback — picks the nearest guess point.
-        const unsigned src_idx = (node * (guess_Minv.size()-1)) / (nnodes-1);
-        Minv[node] = guess_Minv[src_idx];
-      }
-      invertPacked(Minv[node], Mav[node]);
-    } else {
-      if(!read_M && !from_restart) buildLocalMetric(Mav[node]);
-      invertPacked(Mav[node], Minv[node]);
-    }
-
-    // 2. Initial string positions:
-    //    - on restart, path[node] was loaded from the checkpoint.
-    //    - with a guess file: each replica seeds path[node] from the
-    //      guess (interpolated to nnodes if the file has a different point
-    //      count). The interpolation metric is inv(mean_replicas(Mav)) so
-    //      every replica produces the same resampled string.
-    //    - otherwise: each replica's current ARG values become its node.
-    if(!from_restart) {
-      if(!guess_string.empty()) {
-        std::vector<std::vector<double>> resampled(nnodes,
-                                                   std::vector<double>(ncv, 0.0));
-        if(guess_string.size() == nnodes) {
-          resampled = guess_string;
-        } else {
-          std::vector<double> Mtmpinv;
-          gatherMavMeanInverted(Mtmpinv);
-          interpolateLinear(guess_string, resampled, Mtmpinv);
-        }
-        path[node] = resampled[node];
-      } else {
-        initStringFromCurrentCV();
-      }
-    }
-
-    // 3. Sync, build arclengths + tangents + B.
-    reparametrizeLinear();
-
-    // 4. Default K_l auto-tuning if user did not supply force_constant_l.
-    //    Must run before writeParams so force_constants.dat row 0 reflects
-    //    the actual initial K_l, and before updateBLocal so B is consistent.
-    if(K_l_local <= 0.0) {
-      // K_l = RT / (Δ/2)^2 where Δ is the inter-node spacing.
-      const double delta = string_length / double(nnodes-1);
-      const double half_delta = 0.5 * delta;
-      K_l_local = RT / (half_delta * half_delta);
-      for(auto& k : K_l) k = K_l_local;
-    }
-    if(K_d <= 0.0) {
-      K_d = 0.5 * K_l_local;
-    }
-    updateBLocal();
-
-    // Open output files and write the cold-start row of every server log.
-    // Cold-start snapshot is labelled 0.
-    // On restart we use the resumed local_step so the file lines up with
-    // the existing on-disk filenames.
-    if(!outputs_opened) { openOutputFiles(); outputs_opened = true; }
-    const long lstep0 =
-      from_restart ? (getStep() + step0 - long(preparation_steps) + 1) : 0L;
-    if(is_server) {
-      writeSnapshot(lstep0);
-      writeParams();
-      snapshot_steps.push_back(lstep0);
-      // No writeConvergence() at cold-start: the current string equals the
-      // snapshot just written, so every distance would be 0.
-    }
-    // Cold-start 0.ck
-    // Skipped on restart: the file we just read from would only
-    // be re-emitted.
-    if(!from_restart) writeCheckpoint(0);
-
+    initOnFirstCall(phase == Phase::Restarted);
     phase = Phase::Production;
   }
 
