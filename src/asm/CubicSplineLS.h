@@ -19,7 +19,8 @@
    CubicSplineLS — least-squares smoothing cubic splines for the ASM action.
 
    A spline over n+1 reference points produces n cubic segments. Each segment
-   is stored as 5 doubles { x_i, a, b, c, d } so that on segment i:
+   stores its left x and the four polynomial coefficients (a, b, c, d) so
+   that on segment i:
        s(x) = a*(x-x_i)^3 + b*(x-x_i)^2 + c*(x-x_i) + d,   x in [x_i, x_{i+1}].
    Below x_0 (segment 0) the spline extrapolates linearly using s'(x_0); above
    the upper boundary (computed via splineMax) the spline extrapolates linearly
@@ -31,15 +32,17 @@
 
 #include "tools/Matrix.h"
 #include "tools/Exception.h"
-#include <array>
 #include <cmath>
 #include <vector>
 
 namespace PLMD {
 namespace asm_module {
 
-/// One cubic segment: { x_i, a, b, c, d } — see header comment.
-using SplineSegment = std::array<double,5>;
+/// One cubic segment: s(x) = a*(x-x)^3 + b*(x-x)^2 + c*(x-x) + d on [x, x_{next}).
+struct SplineSegment {
+  double x;
+  double a, b, c, d;
+};
 using Spline1D      = std::vector<SplineSegment>;
 using SplineND      = std::vector<Spline1D>;        // [icv][segment]
 
@@ -51,19 +54,19 @@ namespace cubic_spline_detail {
 inline double splineMax(const Spline1D& sp) {
   plumed_assert(!sp.empty());
   const auto& last = sp.back();
-  if(last[1] != 0.0) {
-    return last[0] - last[2] / (last[1]*3.0);
+  if(last.a != 0.0) {
+    return last.x - last.b / (last.a*3.0);
   }
   // Degenerate (linear) last segment: extrapolate one h to the right.
-  if(sp.size() < 2) return last[0];
-  return 2.0*last[0] - sp[sp.size()-2][0];
+  if(sp.size() < 2) return last.x;
+  return 2.0*last.x - sp[sp.size()-2].x;
 }
 
 /// Find the segment index such that x lies in [x_i, x_{i+1}). Walks back
-/// from the end until x >= coef(idx,1).
+/// from the end until x >= sp[idx].x.
 inline std::size_t findSegment(const Spline1D& sp, double x) {
   std::size_t idx = sp.size() - 1;
-  while(idx > 0 && x < sp[idx][0]) --idx;
+  while(idx > 0 && x < sp[idx].x) --idx;
   return idx;
 }
 
@@ -74,29 +77,31 @@ inline std::size_t findSegment(const Spline1D& sp, double x) {
 inline double splineValue(double x, const Spline1D& sp) {
   using namespace cubic_spline_detail;
   plumed_assert(!sp.empty());
-  if(x < sp[0][0]) {
-    return sp[0][3]*(x - sp[0][0]) + sp[0][4];
+  if(x < sp[0].x) {
+    return sp[0].c*(x - sp[0].x) + sp[0].d;
   }
   const double xmax = splineMax(sp);
   if(x > xmax) {
     const auto& last = sp.back();
-    const double dx = xmax - last[0];
-    const double k = last[1]*3.0*dx*dx + last[2]*2.0*dx + last[3];   // s'(xmax)
-    const double ymax = last[1]*dx*dx*dx + last[2]*dx*dx + last[3]*dx + last[4];
+    const double dx = xmax - last.x;
+    const double k = last.a*3.0*dx*dx + last.b*2.0*dx + last.c;       // s'(xmax)
+    const double ymax = last.a*dx*dx*dx + last.b*dx*dx + last.c*dx + last.d;
     return k*(x - xmax) + ymax;
   }
   const std::size_t idx = findSegment(sp, x);
-  const double dx = x - sp[idx][0];
-  return sp[idx][1]*dx*dx*dx + sp[idx][2]*dx*dx + sp[idx][3]*dx + sp[idx][4];
+  const double dx = x - sp[idx].x;
+  return sp[idx].a*dx*dx*dx + sp[idx].b*dx*dx + sp[idx].c*dx + sp[idx].d;
 }
 
-/// Evaluate spline derivative at x.
+/// Evaluate spline derivative at x. Caller must ensure x lies in
+/// [sp[0].x, splineMax(sp)]; unlike splineValue, this routine does not
+/// extrapolate.
 inline double splineDer(double x, const Spline1D& sp) {
   using namespace cubic_spline_detail;
   plumed_assert(!sp.empty());
   const std::size_t idx = findSegment(sp, x);
-  const double dx = x - sp[idx][0];
-  return sp[idx][1]*3.0*dx*dx + sp[idx][2]*2.0*dx + sp[idx][3];
+  const double dx = x - sp[idx].x;
+  return sp[idx].a*3.0*dx*dx + sp[idx].b*2.0*dx + sp[idx].c;
 }
 
 /// ND wrappers.
@@ -232,11 +237,11 @@ inline void cubicSplinesFit(const std::vector<double>& a,
 
   // Pack into segment coefficients.
   for(unsigned i=0; i<nseg; ++i) {
-    coef[i][0] = x[i];
-    coef[i][1] = (Mval[i+1] - Mval[i]) / (6.0*h);
-    coef[i][2] = Mval[i] * 0.5;
-    coef[i][3] = (y[i+1] - y[i]) / h - ((Mval[i+1] + 2.0*Mval[i]) / 6.0)*h;
-    coef[i][4] = y[i];
+    coef[i].x = x[i];
+    coef[i].a = (Mval[i+1] - Mval[i]) / (6.0*h);
+    coef[i].b = Mval[i] * 0.5;
+    coef[i].c = (y[i+1] - y[i]) / h - ((Mval[i+1] + 2.0*Mval[i]) / 6.0)*h;
+    coef[i].d = y[i];
   }
 }
 
