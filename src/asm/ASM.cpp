@@ -33,6 +33,7 @@
 #include "tools/File.h"
 #include "tools/Matrix.h"
 #include "tools/Random.h"
+#include "tools/Units.h"
 #include "CubicSplineLS.h"
 
 #include <array>
@@ -285,9 +286,14 @@ void ASM::registerKeywords(Keywords& keys) {
            "orthogonal harmonic spring constant (default = FORCE_CONSTANT_L/2)");
 
   // Frictions / dynamics
-  keys.add("compulsory", "GAMMA",          "2000",   "string friction (ps^-1)");
-  keys.add("compulsory", "POSITION_GAMMA", "200000", "node-position friction (ps^-1)");
-  keys.add("compulsory", "FORCE_GAMMA",    "5",      "K-adaptation friction");
+  keys.add("compulsory", "GAMMA",          "2000",
+           "string friction in inverse host time units (ps^-1 by default; "
+           "follows the time unit set by the UNITS directive or by the MD "
+           "code's setMDTimeUnits)");
+  keys.add("compulsory", "POSITION_GAMMA", "200000",
+           "node-position friction, same unit convention as GAMMA");
+  keys.add("compulsory", "FORCE_GAMMA",    "2000",
+           "K-adaptation friction, same unit convention as GAMMA");
   keys.add("compulsory", "FORCE_KAPPA",    "1000",   "K-adaptation drift term");
   keys.add("compulsory", "MAV_DAMP",       "1e-3",   "EMA damping for metric tensor");
 
@@ -392,17 +398,25 @@ ASM::ASM(const ActionOptions& ao):
   parse("STRING_MOVE_PERIOD", string_move_period_);
 
   // ---- frictions / dynamics -------------------------------------------
-  parse("GAMMA",          gamma_);
-  parse("POSITION_GAMMA", position_gamma_);
-  parse("FORCE_GAMMA",    force_gamma_);
+  double gamma_user = 0.0, position_gamma_user = 0.0, force_gamma_user = 0.0;
+  parse("GAMMA",          gamma_user);
+  parse("POSITION_GAMMA", position_gamma_user);
+  parse("FORCE_GAMMA",    force_gamma_user);
   parse("FORCE_KAPPA",    force_kappa_);
   parse("MAV_DAMP",       Mav_damp_);
 
-  // Convert user-input ps^-1 to AMBER internal time units (sander
-  // convention; force_gamma is intentionally not rescaled).
-  static constexpr double kSanderGammaScale = 2.3901e-3;
-  gamma_          *= kSanderGammaScale;
-  position_gamma_ *= kSanderGammaScale;
+  // The frictions enter the integrator as `var += drift / friction * dt`,
+  // which is dimensionally consistent only in a unit system where
+  // energy = mass*length^2/time^2 numerically. The factor below from
+  // getUnits() bridges the user's (inverse host time) input into that
+  // system.
+  const Units& U = getUnits();
+  const double gamma_unit_scale =
+    (U.getMass() * U.getLength() * U.getLength()) /
+    (U.getEnergy() * U.getTime() * U.getTime());
+  gamma_          = gamma_user          * gamma_unit_scale;
+  position_gamma_ = position_gamma_user * gamma_unit_scale;
+  force_gamma_    = force_gamma_user    * gamma_unit_scale;
 
   // ---- replica exchange ----------------------------------------------
   parse("REX_PERIOD", REX_period_);
@@ -483,7 +497,12 @@ ASM::ASM(const ActionOptions& ao):
   log.printf("    REX_period=%u%s\n",
              REX_period_, REX_period_ == 0 ? " (disabled)" : "");
   log.printf("    gamma=%g, position_gamma=%g, force_gamma=%g, force_kappa=%g, Mav_damp=%g\n",
-             gamma_, position_gamma_, force_gamma_, force_kappa_, Mav_damp_);
+             gamma_user, position_gamma_user, force_gamma_user, force_kappa_, Mav_damp_);
+  log.printf("    gamma unit scale=%g (energy=%s, length=%s, time=%s)\n",
+             gamma_unit_scale,
+             U.getEnergyString().c_str(),
+             U.getLengthString().c_str(),
+             U.getTimeString().c_str());
   log.printf("    flags: string_move=%s fix_ends=%s read_M=%s rescale_forces=%s\n",
              string_move_    ? "YES":"NO",
              fix_ends_       ? "YES":"NO",
