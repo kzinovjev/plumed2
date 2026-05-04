@@ -99,13 +99,18 @@ private:
   bool                masses_cached = false;
 
   // -------- string state (one slot per node, replica owns slot node) ---
-  std::vector<std::vector<double>> path;     // [nnodes][ncv]
-  std::vector<std::vector<double>> n_vec;      // [nnodes][ncv]
-  std::vector<std::vector<double>> Mav;        // [nnodes][msize]
-  std::vector<std::vector<double>> Minv;       // [nnodes][msize]
-  std::vector<std::vector<double>> B;          // [nnodes][msize]
-  std::vector<double>              pos;        // [nnodes]
-  std::vector<double>              K_l;        // [nnodes]
+  // All cluster-wide per-node state collected in one struct so the parallel
+  // arrays don't drift apart and serialisation is iteration-by-node.
+  struct Node {
+    std::vector<double> cv;        // size ncv  — CV-space coordinates
+    std::vector<double> n;         // size ncv  — tangent
+    std::vector<double> Mav;       // size msize — packed lower-tri metric
+    std::vector<double> Minv;      // size msize
+    std::vector<double> B;         // size msize
+    double pos = 0.0;
+    double K_l = 0.0;
+  };
+  std::vector<Node> nodes;
   double string_length = 0.0;
 
   // -------- per-step accumulators (this node only) ----------------------
@@ -206,13 +211,13 @@ private:
   void initStringFromCurrentCV();
   void buildArcLengths();           // sets L from |string[i+1]-string[i]|_Minv
   void computeTangentsFD();         // tangent at each node from finite differences
-  void normaliseTangentLocal();     // n_vec[node] /= ||n_vec[node]||_Minv
-  void updateBLocal();              // B[node] from K_l, K_d, n_vec, Minv
+  void normaliseTangentLocal();     // nodes[node].n /= ||nodes[node].n||_Minv
+  void updateBLocal();              // nodes[node].B from K_l, K_d, n, Minv
   void reparametrizeLinear();       // gather + arclength + tangent + updateB
   void toContinuousString();        // unwrap periodic CVs along the string
-  void toBoxLocalNode();            // wrap path[node] back into PBC range
+  void toBoxLocalNode();            // wrap nodes[node].cv back into PBC range
   void fitStringSpline();           // smoothing cubic spline over arc-length
-  void splineTangentLocal();        // n_vec[node] from spline derivative at pos[node]
+  void splineTangentLocal();        // nodes[node].n from spline derivative at nodes[node].pos
   double scaleDpos(double x) const; // damping near the neighbour gap
 
   // output writers
@@ -465,20 +470,21 @@ ASM::ASM(const ActionOptions& ao):
   outputForces.assign(ncv, 0.0);
   node_to_rank.resize(nnodes);
   for(unsigned i=0; i<nnodes; ++i) node_to_rank[i] = i;
-  path.assign(nnodes, std::vector<double>(ncv, 0.0));
-  n_vec .assign(nnodes, std::vector<double>(ncv, 0.0));
-  Mav   .assign(nnodes, std::vector<double>(msize, 0.0));
-  Minv  .assign(nnodes, std::vector<double>(msize, 0.0));
-  B     .assign(nnodes, std::vector<double>(msize, 0.0));
-  pos   .assign(nnodes, 0.0);
-  K_l   .assign(nnodes, 0.0);
-  dz    .assign(ncv,    0.0);
+  nodes.assign(nnodes, Node{});
+  for(auto& nd : nodes) {
+    nd.cv  .assign(ncv,   0.0);
+    nd.n   .assign(ncv,   0.0);
+    nd.Mav .assign(msize, 0.0);
+    nd.Minv.assign(msize, 0.0);
+    nd.B   .assign(msize, 0.0);
+  }
+  dz.assign(ncv, 0.0);
 
   // Provisional K assignments — final values (auto-defaults, restart values)
   // are settled in the first calculate() once string_length is known.
   if(K_l_in > 0.0) {
     K_l_local = K_l_in;
-    for(auto& k : K_l) k = K_l_in;
+    for(auto& nd : nodes) nd.K_l = K_l_in;
   }
   K_d = (K_d_in > 0.0) ? K_d_in : 0.0;
 
@@ -628,7 +634,7 @@ void ASM::cvDiff(unsigned i, std::vector<double>& dCV) const {
   // Periodic-aware (CV - string[node]) via Value::difference.
   dCV.resize(ncv);
   for(unsigned k=0; k<ncv; ++k) {
-    dCV[k] = getPntrToArgument(k)->difference(path[i][k], getArgument(k));
+    dCV[k] = getPntrToArgument(k)->difference(nodes[i].cv[k], getArgument(k));
   }
 }
 
@@ -641,10 +647,10 @@ void ASM::gatherStringAcrossReplicas() {
   std::vector<double> sendbuf(pack_n);
   unsigned p = 0;
   sendbuf[p++] = double(node);
-  for(unsigned k=0; k<ncv; ++k)   sendbuf[p++] = path[node][k];
-  for(unsigned k=0; k<msize; ++k) sendbuf[p++] = Mav[node][k];
-  sendbuf[p++] = pos[node];
-  sendbuf[p++] = K_l[node];
+  for(unsigned k=0; k<ncv; ++k)   sendbuf[p++] = nodes[node].cv[k];
+  for(unsigned k=0; k<msize; ++k) sendbuf[p++] = nodes[node].Mav[k];
+  sendbuf[p++] = nodes[node].pos;
+  sendbuf[p++] = nodes[node].K_l;
 
   std::vector<double> recvbuf(pack_n*nnodes, 0.0);
   if(comm.Get_rank() == 0) {
@@ -657,22 +663,22 @@ void ASM::gatherStringAcrossReplicas() {
     const unsigned n = unsigned(rp[0]);
     if(n >= nnodes) continue;
     unsigned q = 1;
-    for(unsigned k=0; k<ncv; ++k)   path[n][k] = rp[q++];
-    for(unsigned k=0; k<msize; ++k) Mav[n][k]    = rp[q++];
-    pos[n] = rp[q++];
-    K_l[n] = rp[q++];
+    for(unsigned k=0; k<ncv; ++k)   nodes[n].cv[k] = rp[q++];
+    for(unsigned k=0; k<msize; ++k) nodes[n].Mav[k]    = rp[q++];
+    nodes[n].pos = rp[q++];
+    nodes[n].K_l = rp[q++];
   }
   for(unsigned i=0; i<nnodes; ++i) {
-    invertPacked(Mav[i], Minv[i]);
+    invertPacked(nodes[i].Mav, nodes[i].Minv);
   }
 }
 
 void ASM::gatherMavMeanInverted(std::vector<double>& Mtmpinv) const {
-  // Sum each replica's Mav[node] across multi_sim_comm, divide by nnodes,
+  // Sum each replica's nodes[node].Mav across multi_sim_comm, divide by nnodes,
   // then invert. Run on rank-0-of-comm and Bcast within comm so every rank
   // of a replica sees the same metric.
   std::vector<double> send(msize), recv(msize*nnodes, 0.0);
-  for(unsigned k=0; k<msize; ++k) send[k] = Mav[node][k];
+  for(unsigned k=0; k<msize; ++k) send[k] = nodes[node].Mav[k];
   if(comm.Get_rank() == 0) {
     plumed.multi_sim_comm.Allgather(send, recv);
   }
@@ -769,20 +775,20 @@ void ASM::initStringFromCurrentCV() {
   // Default initial-guess path: every replica's current ARG values are taken
   // as that node's string position. After Allgather every replica sees the
   // full polyline.
-  for(unsigned k=0; k<ncv; ++k) path[node][k] = getArgument(k);
+  for(unsigned k=0; k<ncv; ++k) nodes[node].cv[k] = getArgument(k);
 }
 
 void ASM::buildArcLengths() {
   // Cumulative metric-weighted arc length along the (continuous-on-PBC)
-  // string. L[0] = 0; L[i] = L[i-1] + ||path[i]-path[i-1]||_M
+  // string. L[0] = 0; L[i] = L[i-1] + ||nodes[i].cv-nodes[i-1].cv||_M
   // using the average of the two adjacent Minv-tensors.
   L.assign(nnodes, 0.0);
   std::vector<double> dx(ncv), Mavg(msize);
   for(unsigned i=1; i<nnodes; ++i) {
     for(unsigned k=0; k<ncv; ++k) {
-      dx[k] = getPntrToArgument(k)->difference(path[i-1][k], path[i][k]);
+      dx[k] = getPntrToArgument(k)->difference(nodes[i-1].cv[k], nodes[i].cv[k]);
     }
-    for(unsigned k=0; k<msize; ++k) Mavg[k] = 0.5*(Minv[i-1][k] + Minv[i][k]);
+    for(unsigned k=0; k<msize; ++k) Mavg[k] = 0.5*(nodes[i-1].Minv[k] + nodes[i].Minv[k]);
     L[i] = L[i-1] + lenM(dx, Mavg);
   }
   string_length = L[nnodes-1];
@@ -796,8 +802,8 @@ void ASM::toContinuousString() {
     Value* v = getPntrToArgument(k);
     if(!v->isPeriodic()) continue;
     for(unsigned i=1; i<nnodes; ++i) {
-      const double d = v->difference(path[i-1][k], path[i][k]);
-      path[i][k] = path[i-1][k] + d;
+      const double d = v->difference(nodes[i-1].cv[k], nodes[i].cv[k]);
+      nodes[i].cv[k] = nodes[i-1].cv[k] + d;
     }
   }
 }
@@ -806,7 +812,7 @@ void ASM::toBoxLocalNode() {
   // Wrap this replica's node back into the canonical periodic range.
   for(unsigned k=0; k<ncv; ++k) {
     Value* v = getPntrToArgument(k);
-    if(v->isPeriodic()) path[node][k] = v->bringBackInPbc(path[node][k]);
+    if(v->isPeriodic()) nodes[node].cv[k] = v->bringBackInPbc(nodes[node].cv[k]);
   }
 }
 
@@ -821,19 +827,19 @@ void ASM::fitStringSpline() {
   // Pack y = [ncv][nnodes] (transpose of path).
   std::vector<std::vector<double>> y(ncv, std::vector<double>(nnodes));
   for(unsigned k=0; k<ncv; ++k)
-    for(unsigned i=0; i<nnodes; ++i) y[k][i] = path[i][k];
+    for(unsigned i=0; i<nnodes; ++i) y[k][i] = nodes[i].cv[k];
 
   string_spline.assign(ncv, Spline1D(nseg));
   cubicSplinesFitND(L, y, string_spline);
 }
 
 void ASM::splineTangentLocal() {
-  // Tangent at this node from the spline derivative at pos[node].
+  // Tangent at this node from the spline derivative at nodes[node].pos.
   // Falls back to the existing finite-difference value when the spline
   // wasn't fit (string_spline empty).
   if(string_spline.empty()) return;
-  std::vector<double> der = splineDerND(pos[node], string_spline);
-  for(unsigned k=0; k<ncv; ++k) n_vec[node][k] = der[k];
+  std::vector<double> der = splineDerND(nodes[node].pos, string_spline);
+  for(unsigned k=0; k<ncv; ++k) nodes[node].n[k] = der[k];
 }
 
 // ----- output suite -------------------------------------------------------
@@ -863,7 +869,7 @@ void ASM::writeDat() {
   // Per-step trajectory: CVs, this node's string position, dz_tmp/gamma.
   if(!dat_stream.isOpen()) return;
   for(unsigned k=0; k<ncv; ++k) dat_stream.printf("%15.5e", getArgument(k));
-  for(unsigned k=0; k<ncv; ++k) dat_stream.printf("%15.5e", path[node][k]);
+  for(unsigned k=0; k<ncv; ++k) dat_stream.printf("%15.5e", nodes[node].cv[k]);
   for(unsigned k=0; k<ncv; ++k)
     dat_stream.printf("%15.5e", gamma > 0.0 ? dz_tmp_last[k] / gamma : 0.0);
   dat_stream.printf("\n");
@@ -884,14 +890,14 @@ void ASM::writeSnapshot(long step) {
   out.precision(5);
   // One row per node, CVs across the row.
   for(unsigned i=0; i<nnodes; ++i) {
-    for(unsigned k=0; k<ncv; ++k) { out.width(15); out << path[i][k]; }
+    for(unsigned k=0; k<ncv; ++k) { out.width(15); out << nodes[i].cv[k]; }
     out << '\n';
   }
   // Re-wrap so subsequent local computation stays inside the canonical box.
   for(unsigned k=0; k<ncv; ++k) {
     Value* v = getPntrToArgument(k);
     if(v->isPeriodic())
-      for(unsigned i=0; i<nnodes; ++i) path[i][k] = v->bringBackInPbc(path[i][k]);
+      for(unsigned i=0; i<nnodes; ++i) nodes[i].cv[k] = v->bringBackInPbc(nodes[i].cv[k]);
   }
 }
 
@@ -910,10 +916,10 @@ void ASM::writeParams() {
   kps.enforceRestart();
   kps.open(k_fname);
   if(!kps) error("ASM: cannot open " + k_fname);
-  const double denom = (pos[nnodes-1] != 0.0) ? pos[nnodes-1] : 1.0;
-  for(unsigned i=0; i<nnodes; ++i) nps.printf("%15.5f", pos[i] / denom);
+  const double denom = (nodes[nnodes-1].pos != 0.0) ? nodes[nnodes-1].pos : 1.0;
+  for(unsigned i=0; i<nnodes; ++i) nps.printf("%15.5f", nodes[i].pos / denom);
   nps.printf("\n");
-  for(unsigned i=0; i<nnodes; ++i) kps.printf("%15.5f", K_l[i]);
+  for(unsigned i=0; i<nnodes; ++i) kps.printf("%15.5f", nodes[i].K_l);
   kps.printf("\n");
 }
 
@@ -950,8 +956,8 @@ void ASM::writeConvergence(long current_step) {
     std::vector<double> dx(ncv);
     for(unsigned i=0; i<nnodes; ++i) {
       for(unsigned k=0; k<ncv; ++k)
-        dx[k] = getPntrToArgument(k)->difference(tmp[i][k], path[i][k]);
-      dist += lenM(dx, Minv[i]);
+        dx[k] = getPntrToArgument(k)->difference(tmp[i][k], nodes[i].cv[k]);
+      dist += lenM(dx, nodes[i].Minv);
     }
     dist /= double(nnodes);
     if(!std::isfinite(dist)) {
@@ -1056,11 +1062,13 @@ void ASM::writeCheckpoint(long local_step) {
   out << '\n';
 
   out << "string\n";
-  for(unsigned i=0; i<nnodes; ++i) emit_row(path[i]);
+  for(unsigned i=0; i<nnodes; ++i) emit_row(nodes[i].cv);
   out << "Mav\n";
-  for(unsigned i=0; i<nnodes; ++i) emit_row(Mav[i]);
-  out << "pos\n";        emit_scalar_row(pos);
-  out << "K_l\n";        emit_scalar_row(K_l);
+  for(unsigned i=0; i<nnodes; ++i) emit_row(nodes[i].Mav);
+  std::vector<double> pos_flat(nnodes), K_l_flat(nnodes);
+  for(unsigned i=0; i<nnodes; ++i) { pos_flat[i] = nodes[i].pos; K_l_flat[i] = nodes[i].K_l; }
+  out << "pos\n";        emit_scalar_row(pos_flat);
+  out << "K_l\n";        emit_scalar_row(K_l_flat);
   out << "dz\n";
   for(unsigned i=0; i<nnodes; ++i) emit_row(dz_full[i]);
   out << "dpos\n";       emit_scalar_row(dpos_full);
@@ -1091,12 +1099,23 @@ void ASM::readCheckpoint() {
     error("ASM RESTART: cannot open " + fname);
   }
 
-  // Pre-size cluster-wide buffers (the constructor already sized them, but
-  // be defensive — read order is independent of the assign ordering above).
-  path.assign(nnodes, std::vector<double>(ncv, 0.0));
-  Mav   .assign(nnodes, std::vector<double>(msize, 0.0));
-  pos   .assign(nnodes, 0.0);
-  K_l   .assign(nnodes, 0.0);
+  // The constructor already sized `nodes`, but be defensive.
+  if(nodes.size() != nnodes) {
+    nodes.assign(nnodes, Node{});
+    for(auto& nd : nodes) {
+      nd.cv  .assign(ncv,   0.0);
+      nd.n   .assign(ncv,   0.0);
+      nd.Mav .assign(msize, 0.0);
+      nd.Minv.assign(msize, 0.0);
+      nd.B   .assign(msize, 0.0);
+    }
+  }
+  // Parse cluster-wide arrays into flat buffers; transfer into `nodes` at
+  // the end so the handler table doesn't have to reach inside Node.
+  std::vector<std::vector<double>> path_tmp(nnodes, std::vector<double>(ncv,   0.0));
+  std::vector<std::vector<double>> Mav_tmp (nnodes, std::vector<double>(msize, 0.0));
+  std::vector<double>              pos_tmp (nnodes, 0.0);
+  std::vector<double>              K_l_tmp (nnodes, 0.0);
   std::vector<std::vector<double>> dz_full(nnodes, std::vector<double>(ncv, 0.0));
   std::vector<double> dpos_full(nnodes, 0.0), dK_full(nnodes, 0.0);
   std::vector<double> mdx_full (nnodes, 0.0), ms2_full(nnodes, 0.0);
@@ -1128,10 +1147,10 @@ void ASM::readCheckpoint() {
     {"ncv",         [&]{ in >> ck_ncv;           }},
     {"K_d",         [&]{ in >> K_d;             }},
     {"rank_to_node",read_1d(rank_to_node_ck, "rank_to_node")},
-    {"string",      read_2d(path,   "string")},
-    {"Mav",         read_2d(Mav,      "Mav")},
-    {"pos",         read_1d(pos,      "pos")},
-    {"K_l",         read_1d(K_l,      "K_l")},
+    {"string",      read_2d(path_tmp, "string")},
+    {"Mav",         read_2d(Mav_tmp,  "Mav")},
+    {"pos",         read_1d(pos_tmp,  "pos")},
+    {"K_l",         read_1d(K_l_tmp,  "K_l")},
     {"dz",          read_2d(dz_full,   "dz")},
     {"dpos",        read_1d(dpos_full, "dpos")},
     {"dK",          read_1d(dK_full,   "dK")},
@@ -1170,6 +1189,14 @@ void ASM::readCheckpoint() {
     }
   }
 
+  // Move the parsed cluster-wide arrays into the node-of-arrays layout.
+  for(unsigned i=0; i<nnodes; ++i) {
+    nodes[i].cv  = std::move(path_tmp[i]);
+    nodes[i].Mav = std::move(Mav_tmp[i]);
+    nodes[i].pos = pos_tmp[i];
+    nodes[i].K_l = K_l_tmp[i];
+  }
+
   // Restore this rank's node identity from the checkpoint, then pick
   // accumulator slots by node
   const unsigned my_msc_rank = node;
@@ -1184,7 +1211,7 @@ void ASM::readCheckpoint() {
   dK          = dK_full [node];
   mean_dx     = mdx_full[node];
   mean_sigma2 = ms2_full[node];
-  K_l_local   = K_l[node];
+  K_l_local   = nodes[node].K_l;
 
   // Pick step0 so the first post-restart calculate (getStep()=0)
   // reproduces saved_local_step under the local_step formula.
@@ -1197,12 +1224,12 @@ void ASM::readCheckpoint() {
 
 double ASM::biasEnergyAt(unsigned node_idx,
                          const std::vector<double>& cv_at) const {
-  // 0.5 * (cv_at - path[node_idx])^T B[node_idx] (cv_at - path[node_idx])
+  // 0.5 * (cv_at - nodes[node_idx].cv)^T nodes[node_idx].B (cv_at - nodes[node_idx].cv)
   std::vector<double> dCV(ncv);
   for(unsigned k=0; k<ncv; ++k) {
-    dCV[k] = getPntrToArgument(k)->difference(path[node_idx][k], cv_at[k]);
+    dCV[k] = getPntrToArgument(k)->difference(nodes[node_idx].cv[k], cv_at[k]);
   }
-  return 0.5 * dotProductM(dCV, dCV, B[node_idx]);
+  return 0.5 * dotProductM(dCV, dCV, nodes[node_idx].B);
 }
 
 // ----- replica exchange ---------------------------------------------------
@@ -1325,10 +1352,10 @@ void ASM::attemptReplicaExchange(long local_step) {
   applyRexSwaps(accept, dz_by_node, dpos_by_node, dK_by_node,
                 mdx_by_node, ms2_by_node, any_swap);
 
-  // Refresh B/n_vec/Minv for the new node on every rank, even those
-  // that weren't part of a swap, because reparametrizeLinear is a collective
-  // (Allgather) call — partial participation would hang MPI. Skip entirely
-  // if no swap happened anywhere.
+  // Refresh nodes[node].B / .n / .Minv for the new node on every rank,
+  // even those that weren't part of a swap, because reparametrizeLinear is a
+  // collective (Allgather) call — partial participation would hang MPI. Skip
+  // entirely if no swap happened anywhere.
   if(any_swap) {
     is_terminal = (node == 0 || node+1 == nnodes);
     is_server   = (node == 0);
@@ -1347,8 +1374,8 @@ double ASM::scaleDpos(double x) const {
   // Exponential damping that prevents node-position inversions: the move
   // is throttled as |x| approaches the gap to the relevant neighbour.
   if(node == 0 || node + 1 >= nnodes) return x;
-  const double gap_right = pos[node+1] - pos[node];
-  const double gap_left  = pos[node]   - pos[node-1];
+  const double gap_right = nodes[node+1].pos - nodes[node].pos;
+  const double gap_left  = nodes[node].pos   - nodes[node-1].pos;
   const double d = (x > 0.0) ? gap_right : gap_left;
   if(d <= 0.0) return 0.0;
   return x * std::exp(-x*x / (d*d) * 4.0);
@@ -1363,17 +1390,17 @@ void ASM::computeTangentsFD() {
     const unsigned a = (i == 0) ? 0 : i-1;
     const unsigned b = (i+1 == nnodes) ? nnodes-1 : i+1;
     for(unsigned k=0; k<ncv; ++k) {
-      dx[k] = getPntrToArgument(k)->difference(path[a][k], path[b][k]);
+      dx[k] = getPntrToArgument(k)->difference(nodes[a].cv[k], nodes[b].cv[k]);
     }
-    n_vec[i] = dx;
+    nodes[i].n = dx;
   }
 }
 
 void ASM::normaliseTangentLocal() {
   // n -> n / ||n||_Minv where ||v||_Minv^2 = v^T Minv v.
-  const double L = lenM(n_vec[node], Minv[node]);
+  const double L = lenM(nodes[node].n, nodes[node].Minv);
   if(L > 0.0) {
-    for(unsigned k=0; k<ncv; ++k) n_vec[node][k] /= L;
+    for(unsigned k=0; k<ncv; ++k) nodes[node].n[k] /= L;
   }
 }
 
@@ -1382,15 +1409,15 @@ void ASM::updateBLocal() {
   // S_ij  = Minvn_i * Minvn_j      (outer product)
   // B = S*(K_l - K_d) + Minv*K_d
   std::vector<double> Minvn;
-  matVecPacked(Minv[node], n_vec[node], Minvn);
+  matVecPacked(nodes[node].Minv, nodes[node].n, Minvn);
 
-  std::vector<double>& Bn = B[node];
+  std::vector<double>& Bn = nodes[node].B;
   Bn.assign(msize, 0.0);
   unsigned p = 0;
-  const double dk = K_l[node] - K_d;
+  const double dk = nodes[node].K_l - K_d;
   for(unsigned i=0; i<ncv; ++i) {
     for(unsigned j=0; j<=i; ++j) {
-      Bn[p] = Minvn[i]*Minvn[j]*dk + Minv[node][p]*K_d;
+      Bn[p] = Minvn[i]*Minvn[j]*dk + nodes[node].Minv[p]*K_d;
       ++p;
     }
   }
@@ -1407,35 +1434,35 @@ void ASM::reparametrizeLinear() {
 
   const double old_length = string_length;
   if(rescale_forces && !first_reparametrize && old_length > 0.0) {
-    for(auto& k : K_l) k *= old_length*old_length;
+    for(auto& nd : nodes) nd.K_l *= old_length*old_length;
   }
   buildArcLengths();
   if(rescale_forces && !first_reparametrize && string_length > 0.0) {
-    for(auto& k : K_l) k /= string_length*string_length;
+    for(auto& nd : nodes) nd.K_l /= string_length*string_length;
   }
 
   // First reparametrize: pos = L (the M-weighted arc lengths just built),
   // making the linear-interpolation step below a no-op (j=node, frac=1).
   // Otherwise rescale proportionally to the new total length.
   if(first_reparametrize) {
-    for(unsigned i=0; i<nnodes; ++i) pos[i] = L[i];
-  } else if(string_move && pos[nnodes-1] > 0.0) {
-    const double scale = string_length / pos[nnodes-1];
-    for(unsigned i=0; i<nnodes; ++i) pos[i] *= scale;
+    for(unsigned i=0; i<nnodes; ++i) nodes[i].pos = L[i];
+  } else if(string_move && nodes[nnodes-1].pos > 0.0) {
+    const double scale = string_length / nodes[nnodes-1].pos;
+    for(unsigned i=0; i<nnodes; ++i) nodes[i].pos *= scale;
   }
 
-  // Linear interpolation: redistribute non-terminal nodes onto pos[node].
+  // Linear interpolation: redistribute non-terminal nodes onto nodes[node].pos.
   if(!is_terminal) {
     unsigned j = 1;
-    while(j+1 < nnodes && L[j] < pos[node]) ++j;
+    while(j+1 < nnodes && L[j] < nodes[node].pos) ++j;
     const double denom = L[j] - L[j-1];
-    const double frac = (denom > 0.0) ? (pos[node] - L[j-1])/denom : 0.0;
+    const double frac = (denom > 0.0) ? (nodes[node].pos - L[j-1])/denom : 0.0;
     std::vector<double> dz_redist(ncv);
     for(unsigned k=0; k<ncv; ++k) {
-      const double seg = getPntrToArgument(k)->difference(path[j-1][k], path[j][k]);
-      dz_redist[k] = path[j-1][k] + seg*frac - path[node][k];
+      const double seg = getPntrToArgument(k)->difference(nodes[j-1].cv[k], nodes[j].cv[k]);
+      dz_redist[k] = nodes[j-1].cv[k] + seg*frac - nodes[node].cv[k];
     }
-    for(unsigned k=0; k<ncv; ++k) path[node][k] += dz_redist[k];
+    for(unsigned k=0; k<ncv; ++k) nodes[node].cv[k] += dz_redist[k];
   }
 
   // Re-sync after the local redistribution.
@@ -1467,13 +1494,13 @@ void ASM::update() {
 
     if(!(fix_ends && is_terminal)) {
       const double scale = inv_smp / gamma;
-      for(unsigned k=0; k<ncv; ++k) path[node][k] += dz[k] * scale;
+      for(unsigned k=0; k<ncv; ++k) nodes[node].cv[k] += dz[k] * scale;
     }
     if(!is_terminal) {
       const double raw = dpos * inv_smp / position_gamma;
-      pos[node] += scaleDpos(raw);
+      nodes[node].pos += scaleDpos(raw);
     }
-    K_l[node] += dK * inv_smp / force_gamma;
+    nodes[node].K_l += dK * inv_smp / force_gamma;
 
     // No standalone K_l gather: reparametrizeLinear() below begins with a
     // node-aware gatherStringAcrossReplicas() that packs K_l with everything
@@ -1522,22 +1549,22 @@ void ASM::initOnFirstCall(bool from_restart) {
     // Pick the guess-Minv slot matching this node — interpolate when the
     // guess has a different point count, otherwise direct copy.
     if(guess_Minv.size() == nnodes) {
-      Minv[node] = guess_Minv[node];
+      nodes[node].Minv = guess_Minv[node];
     } else {
       // For the metric, "linear interpolation between Minv tensors" is a
       // crude but standard fallback — picks the nearest guess point.
       const unsigned src_idx = (node * (guess_Minv.size()-1)) / (nnodes-1);
-      Minv[node] = guess_Minv[src_idx];
+      nodes[node].Minv = guess_Minv[src_idx];
     }
-    invertPacked(Minv[node], Mav[node]);
+    invertPacked(nodes[node].Minv, nodes[node].Mav);
   } else {
-    if(!read_M && !from_restart) buildLocalMetric(Mav[node]);
-    invertPacked(Mav[node], Minv[node]);
+    if(!read_M && !from_restart) buildLocalMetric(nodes[node].Mav);
+    invertPacked(nodes[node].Mav, nodes[node].Minv);
   }
 
   // 2. Initial string positions:
-  //    - on restart, path[node] was loaded from the checkpoint.
-  //    - with a guess file: each replica seeds path[node] from the
+  //    - on restart, nodes[node].cv was loaded from the checkpoint.
+  //    - with a guess file: each replica seeds nodes[node].cv from the
   //      guess (interpolated to nnodes if the file has a different point
   //      count). The interpolation metric is inv(mean_replicas(Mav)) so
   //      every replica produces the same resampled string.
@@ -1553,7 +1580,7 @@ void ASM::initOnFirstCall(bool from_restart) {
         gatherMavMeanInverted(Mtmpinv);
         interpolateLinear(guess_string, resampled, Mtmpinv);
       }
-      path[node] = resampled[node];
+      nodes[node].cv = resampled[node];
     } else {
       initStringFromCurrentCV();
     }
@@ -1570,7 +1597,7 @@ void ASM::initOnFirstCall(bool from_restart) {
     const double delta = string_length / double(nnodes-1);
     const double half_delta = 0.5 * delta;
     K_l_local = RT / (half_delta * half_delta);
-    for(auto& k : K_l) k = K_l_local;
+    for(auto& nd : nodes) nd.K_l = K_l_local;
   }
   if(K_d <= 0.0) {
     K_d = 0.5 * K_l_local;
@@ -1610,12 +1637,12 @@ void ASM::calculate() {
   if(string_move && !read_M) buildLocalMetric(M_now);
 
   // 2. Apply harmonic force on the input ARGs:
-  //      F_i = -force_scale * (B[node] · diff(CV - string[node]))_i
+  //      F_i = -force_scale * (nodes[node].B · diff(CV - string[node]))_i
   //      energy = 0.5 * force_scale * diff^T B diff
   std::vector<double> dCV;
   cvDiff(node, dCV);
   std::vector<double> B_dCV;
-  matVecPacked(B[node], dCV, B_dCV);
+  matVecPacked(nodes[node].B, dCV, B_dCV);
   double ene = 0.0, totf2 = 0.0;
   for(unsigned k=0; k<ncv; ++k) {
     const double f = -force_scale * B_dCV[k];
@@ -1628,10 +1655,10 @@ void ASM::calculate() {
 
   // 3. EMA-update Mav and refresh Minv.
   if(string_move && !read_M) {
-    auto& Mav_node = Mav[node];
+    auto& Mav_node = nodes[node].Mav;
     for(unsigned k=0; k<msize; ++k)
       Mav_node[k] = (1.0 - Mav_damp)*Mav_node[k] + Mav_damp*M_now[k];
-    invertPacked(Mav_node, Minv[node]);
+    invertPacked(Mav_node, nodes[node].Minv);
     normaliseTangentLocal();
   }
 
@@ -1653,18 +1680,18 @@ void ASM::calculate() {
   }
 
   // dz_tmp: orthogonal displacement.
-  //   tangent dot:   t = dCV · (Minv · n_vec)  using current Minv
-  //   dz_tmp_i = K_d * (dCV_i - n_vec_i * t)
+  //   tangent dot:   t = dCV · (Minv · n)  using current Minv
+  //   dz_tmp_i = K_d * (dCV_i - n_i * t)
   std::vector<double> Minvn;
-  matVecPacked(Minv[node], n_vec[node], Minvn);
+  matVecPacked(nodes[node].Minv, nodes[node].n, Minvn);
   double tdot = 0.0;
   for(unsigned k=0; k<ncv; ++k) tdot += dCV[k] * Minvn[k];
   std::vector<double> dz_tmp(ncv, 0.0);
-  for(unsigned k=0; k<ncv; ++k) dz_tmp[k] = K_d * (dCV[k] - n_vec[node][k]*tdot);
+  for(unsigned k=0; k<ncv; ++k) dz_tmp[k] = K_d * (dCV[k] - nodes[node].n[k]*tdot);
 
   // dpos_tmp / sigma2 EMA / dK_tmp.
   const double delta = string_length / double(nnodes-1);
-  const double pos_target = delta*double(node) - pos[node];
+  const double pos_target = delta*double(node) - nodes[node].pos;
   const double sigma2_target = 0.25 * delta * delta;
   double dpos_tmp = pos_target - tdot;
 
@@ -1684,7 +1711,7 @@ void ASM::calculate() {
     dK_tmp = RT/sigma2_target - RT/mean_sigma2
            + force_kappa * mean_dx * mean_dx;
   }
-  dpos_tmp *= K_l[node];
+  dpos_tmp *= nodes[node].K_l;
 
   // The phantom local_step=0 row is written for .dat row-count parity
   // but must not contribute to the dz/dpos/dK accumulators.
