@@ -16,7 +16,7 @@
 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */
 
 /*
-   FuncPathASM — Adaptive String Method path collective variable.
+   FuncPathASM — path collective variable for the adaptive string method.
 
    Given a discretized path in an arbitrary CV space and a per-node
    inverse-metric tensor, this action computes:
@@ -25,11 +25,11 @@
      z = -log(Σ w_j) / λ               (distance from the path)
 
    with weights w_i = exp(-λ · d_i) and distance
-   d_i = sqrt[(x - p_i)^T · Minv_i · (x - p_i)] computed in the CV space.
+   d_i = sqrt[(x - p_i)^T · Minv_i · (x - p_i)] in the CV space.
 
    The path, arc-length array, λ, and per-node inverse metric tensors are
-   read from a "pathCV.def" file. File layout (free-format, 
-   whitespace-separated):
+   read from a "pathCV.def" file with free-format, whitespace-separated
+   layout:
 
      nCV  npoints  lambda
      arc[0]  arc[1]  ...  arc[npoints-1]
@@ -72,7 +72,7 @@ PLUMED_REGISTER_ACTION(FuncPathASM, "FUNCPATHASM")
 void FuncPathASM::registerKeywords(Keywords& keys) {
   Function::registerKeywords(keys);
   keys.add("compulsory", "REFERENCE",
-           "path-CV definition file in AMBER ASM 'pathCV.def' format");
+           "path-CV definition file (see manual for the pathCV.def layout)");
   keys.addOutputComponent("s", "default", "scalar", "progress along the path");
   keys.addOutputComponent("z", "default", "scalar", "distance from the path");
 }

@@ -16,11 +16,10 @@
 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */
 
 /*
-   ASM — Adaptive String Method (string-evolution stage), PLUMED port of
-   ASM implementation in Amber. The action applies a moving harmonic
-   restraint, accumulates a mass-weighted metric tensor, evolves and
-   reparametrizes the string across MPI replicas and writes the full sander
-   output suite plus a checkpoint.
+   ASM — Adaptive String Method (string-evolution stage). The action applies
+   a moving harmonic restraint, accumulates a mass-weighted metric tensor,
+   evolves and reparametrizes the string across MPI replicas, and writes
+   the per-step / per-period output suite plus a checkpoint.
 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */
 
 #include "core/ActionAtomistic.h"
@@ -63,7 +62,7 @@ private:
   bool     is_terminal_ = false;
   bool     is_server_   = false;     // node_ == 0
 
-  // -------- physics knobs (sander names) --------------------------------
+  // -------- physics knobs ----------------------------------------------
   double K_l_local_      = 0.0;
   double K_d_            = 0.0;
   double gamma_          = 0.0;
@@ -84,7 +83,7 @@ private:
   unsigned REX_period_          = 0;
   long     start_step_          = 0;
   // local_step = getStep() + step0_ - preparation_steps_ + 1.
-  // The +1 mirrors sander's pre-increment of `step`.
+  // The +1 makes local_step 1-based at the first production step.
   // Cold start: step0_ = 0. Restart: step0_ chosen so the first
   // post-restart calculate reproduces the saved local_step.
   long     step0_               = 0;
@@ -183,11 +182,11 @@ private:
 
   // multi-replica state synchronisation
   void gatherStringAcrossReplicas();
-  // Cross-replica average of Mav, inverted (sander asm.F90:388-390): used
-  // as a single consistent metric for cold-start guess interpolation.
+  // Cross-replica average of Mav, inverted: used as a single consistent
+  // metric for cold-start guess interpolation.
   void gatherMavMeanInverted(std::vector<double>& Mtmpinv) const;
 
-  // initial-guess (sander guess_file)
+  // initial-guess support
   std::vector<std::vector<double>> guess_string_;   // [ninit][ncv], empty if not used
   std::vector<std::vector<double>> guess_Minv_;     // [ninit][msize], populated only if read_M
   void readGuessFile(const std::string& path);
@@ -206,9 +205,9 @@ private:
   void toBoxLocalNode();            // wrap string_[node_] back into PBC range
   void fitStringSpline();           // smoothing cubic spline over arc-length
   void splineTangentLocal();        // n_vec_[node_] from spline derivative at pos_[node_]
-  double scaleDpos(double x) const; // sander scale_dpos: damping near the neighbour gap
+  double scaleDpos(double x) const; // damping near the neighbour gap
 
-  // output writers (sander asm.F90:641-968)
+  // output writers
   void mkOutputDir() const;
   void openOutputFiles();
   void writeDat();                  // {node_}.dat — per-step append
@@ -258,8 +257,7 @@ void ASM::registerKeywords(Keywords& keys) {
   keys.add("hidden", "STRIDE",
            "internal use; ASM forces stride to 1");
 
-  // I/O. Keyword spellings match sander's namelist variables; PLUMED's
-  // input parser is case-insensitive but stores keys uppercase.
+  // I/O.
   keys.add("compulsory", "DIR", "results",
            "output directory for {node}.dat, {step}.string, parameter logs");
   keys.add("compulsory", "OUTPUT_PERIOD", "100",
@@ -314,11 +312,11 @@ void ASM::registerKeywords(Keywords& keys) {
 
   // Initial guess
   keys.add("optional", "GUESS_FILE",
-           "initial-guess file (sander format); empty means use the current ARG values");
+           "initial-guess file (see manual for format); empty means use the current ARG values");
 
-  // Temperature (read by getkBT(); not needed if MD code passes kBT)
+  // Temperature (read by getkBT(); not needed if the host passes kBT)
   keys.add("optional", "TEMP",
-           "the system temperature; only needed if the MD code does not pass kBT to PLUMED");
+           "the system temperature; only needed if PLUMED is not given kBT externally");
 
   // Output components
   keys.addOutputComponent("bias",   "default", "scalar", "instantaneous value of the bias potential");
@@ -390,8 +388,8 @@ ASM::ASM(const ActionOptions& ao):
 
   // ---- stage timing ----------------------------------------------------
   parse("PREPARATION_STEPS", preparation_steps_);
-  // START_STEP is now production-relative (sander signed convention): 0 means
-  // string evolution begins immediately at the first production step.
+  // START_STEP is production-relative: 0 means string evolution begins
+  // immediately at the first production step.
   long start_step_in = -1;
   parse("START_STEP", start_step_in);
   start_step_ = (start_step_in >= 0) ? start_step_in : 0;
@@ -470,12 +468,12 @@ ASM::ASM(const ActionOptions& ao):
   // honours a TEMP keyword if present.
   RT_ = getkBT();
   if(RT_ <= 0.0) {
-    // Fall back to a sane default if the host MD has not provided kBT yet.
-    log.printf("  WARNING: kBT not yet set by host MD; using 2.5 (kJ/mol) as placeholder\n");
+    // Fall back to a sane default if the host has not provided kBT yet.
+    log.printf("  WARNING: kBT not yet set by host; using 2.5 (kJ/mol) as placeholder\n");
     RT_ = 2.5;
   }
 
-  // Initial-guess file (sander format).
+  // Initial-guess file.
   std::string guess_file;
   parse("GUESS_FILE", guess_file);
   if(!guess_file.empty()) readGuessFile(guess_file);
@@ -609,7 +607,7 @@ double ASM::lenM(const std::vector<double>& v,
 }
 
 void ASM::cvDiff(unsigned i, std::vector<double>& dCV) const {
-  // Periodic-aware (CV - string[node_]) — sander's map_periodic(CVs - string).
+  // Periodic-aware (CV - string[node_]) via Value::difference.
   dCV.resize(ncv_);
   for(unsigned k=0; k<ncv_; ++k) {
     dCV[k] = getPntrToArgument(k)->difference(string_[i][k], getArgument(k));
@@ -653,9 +651,8 @@ void ASM::gatherStringAcrossReplicas() {
 
 void ASM::gatherMavMeanInverted(std::vector<double>& Mtmpinv) const {
   // Sum each replica's Mav_[node_] across multi_sim_comm, divide by nnodes_,
-  // then invert. Equivalent to sander's mpi_allreduce(SUM)+matinv pair at
-  // asm.F90:388-390. Run on rank-0-of-comm and Bcast within comm so every
-  // MD rank of a replica sees the same metric.
+  // then invert. Run on rank-0-of-comm and Bcast within comm so every rank
+  // of a replica sees the same metric.
   std::vector<double> send(msize_), recv(msize_*nnodes_, 0.0);
   for(unsigned k=0; k<msize_; ++k) send[k] = Mav_[node_][k];
   if(comm.Get_rank() == 0) {
@@ -673,15 +670,12 @@ void ASM::gatherMavMeanInverted(std::vector<double>& Mtmpinv) const {
 }
 
 void ASM::readGuessFile(const std::string& path) {
-  // Sander guess-file format (asm.F90:380-396):
+  // Guess-file format:
   //   line 1:    ninit (integer)
-  //   following: ninit*ncv doubles in row-major order — each row is one
-  //              point's CV vector. (Sander reads column-major into a
-  //              (ncv, ninit) array; for free-format Fortran read this
-  //              is functionally identical to whitespace-separated
-  //              ninit*ncv values.)
+  //   following: ninit*ncv whitespace-separated doubles — each row is one
+  //              point's CV vector.
   //   if read_M: ninit*msize doubles for the per-point Minv (lower-tri
-  //              packed, same layout as our Mav_/Minv_ packing).
+  //              packed, same layout as Mav_/Minv_).
   std::ifstream in(path);
   if(!in) error("ASM: cannot open GUESS_FILE '" + path + "'");
   unsigned ninit = 0;
@@ -716,8 +710,7 @@ void ASM::interpolateLinear(const std::vector<std::vector<double>>& src,
                             std::vector<std::vector<double>>&       dst,
                             const std::vector<double>&              metric_packed) const {
   // Resample src (ninit points) onto dst (nnodes_ points) at equally-spaced
-  // arc-lengths in the supplied metric. Endpoints preserved. (sander
-  // interpolate_linear at asm.F90:402-445.)
+  // arc-lengths in the supplied metric. Endpoints preserved.
   const unsigned ninit  = src.size();
   const unsigned nfinal = dst.size();
   plumed_assert(ninit >= 2 && nfinal >= 2);
@@ -764,8 +757,7 @@ void ASM::initStringFromCurrentCV() {
 void ASM::buildArcLengths() {
   // Cumulative metric-weighted arc length along the (continuous-on-PBC)
   // string. L_[0] = 0; L_[i] = L_[i-1] + ||string_[i]-string_[i-1]||_M
-  // using the average of the two adjacent Minv-tensors. (sander
-  // reparameterize_linear, asm.F90:1218-1222.)
+  // using the average of the two adjacent Minv-tensors.
   L_.assign(nnodes_, 0.0);
   std::vector<double> dx(ncv_), Mavg(msize_);
   for(unsigned i=1; i<nnodes_; ++i) {
@@ -781,7 +773,7 @@ void ASM::buildArcLengths() {
 void ASM::toContinuousString() {
   // For each periodic CV, unwrap the string so consecutive nodes differ by
   // at most half a period — required for a sensible spline fit and for
-  // monotone arc-length accumulation. (sander to_continuous.)
+  // monotone arc-length accumulation.
   for(unsigned k=0; k<ncv_; ++k) {
     Value* v = getPntrToArgument(k);
     if(!v->isPeriodic()) continue;
@@ -801,10 +793,9 @@ void ASM::toBoxLocalNode() {
 }
 
 void ASM::fitStringSpline() {
-  // Smoothing cubic-spline fit over arc length (sander allocates
-  // string_spline_smooth(nnodes/2-1, ...). For small nnodes (<4) the LS
-  // fit degenerates; in that regime the FD tangent is fine and we leave
-  // string_spline_ empty as a signal to fall back.
+  // Smoothing cubic-spline fit over arc length, with nseg = max(1, nnodes/2-1).
+  // For small nnodes (<4) the LS fit degenerates; in that regime the FD
+  // tangent is fine and we leave string_spline_ empty as a signal to fall back.
   string_spline_.clear();
   if(nnodes_ < 4) return;
   const unsigned nseg = std::max(1u, (nnodes_ / 2u) - 1u);
@@ -838,11 +829,10 @@ void ASM::mkOutputDir() const {
 
 void ASM::openOutputFiles() {
   mkOutputDir();
-  // 1-based filename to match sander's 1.dat .. N.dat convention. Internal
-  // C++ indexing remains 0-based; only the on-disk name is offset.
+  // 1-based on-disk filename (1.dat .. N.dat). Internal C++ indexing
+  // remains 0-based; only the file name is offset.
   const std::string fname = dir_ + std::to_string(node_ + 1) + ".dat";
-  // Append mode so a restart continues an existing trajectory; sander's
-  // assign_dat_file uses access="append" (asm.F90:484).
+  // Append mode so a restart continues an existing trajectory.
   dat_stream_.open(fname, std::ios::out | std::ios::app);
   if(!dat_stream_) error("ASM: failed to open " + fname + " for output");
   dat_stream_.setf(std::ios::scientific);
@@ -851,7 +841,6 @@ void ASM::openOutputFiles() {
 
 void ASM::writeDat() {
   // Per-step trajectory: CVs, this node's string position, dz_tmp/gamma.
-  // (sander write_dat at asm.F90:641-648.)
   if(!dat_stream_) return;
   auto fmt = [&](double v) { dat_stream_.width(15); dat_stream_ << v; };
   for(unsigned k=0; k<ncv_; ++k) fmt(getArgument(k));
@@ -863,15 +852,14 @@ void ASM::writeDat() {
 
 void ASM::writeSnapshot(long step) {
   // {step}.string: all node coordinates in the spline-continuous form.
-  // Server-only. (sander write_string at asm.F90:847-901.)
+  // Server-only.
   toContinuousString();
   const std::string fname = dir_ + std::to_string(step) + ".string";
   std::ofstream out(fname);
   if(!out) { log.printf("WARNING: ASM cannot open %s\n", fname.c_str()); return; }
   out.setf(std::ios::scientific);
   out.precision(5);
-  // Sander writes the 2-D string array column-major (CVs varying fastest);
-  // we mirror that one row per node so analysis tooling sees the same layout.
+  // One row per node, CVs across the row.
   for(unsigned i=0; i<nnodes_; ++i) {
     for(unsigned k=0; k<ncv_; ++k) { out.width(15); out << string_[i][k]; }
     out << '\n';
@@ -886,7 +874,6 @@ void ASM::writeSnapshot(long step) {
 
 void ASM::writeParams() const {
   // node_positions.dat & force_constants.dat — appended every output_period.
-  // (sander write_params at asm.F90:907-921.)
   const std::string n_fname = dir_ + "node_positions.dat";
   const std::string k_fname = dir_ + "force_constants.dat";
   std::ofstream nps(n_fname, std::ios::out | std::ios::app);
@@ -1182,8 +1169,6 @@ void ASM::readCheckpoint() {
              saved_local_step, fname.c_str());
 }
 
-// ----- replica exchange (sander asm.F90:1017-1183) ------------------------
-
 double ASM::biasEnergyAt(unsigned node_idx,
                          const std::vector<double>& cv_at) const {
   // 0.5 * (cv_at - string_[node_idx])^T B_[node_idx] (cv_at - string_[node_idx])
@@ -1193,6 +1178,8 @@ double ASM::biasEnergyAt(unsigned node_idx,
   }
   return 0.5 * dotProductM(dCV, dCV, B_[node_idx]);
 }
+
+// ----- replica exchange ---------------------------------------------------
 
 void ASM::attemptReplicaExchange(long local_step) {
   if(REX_period_ == 0 || nnodes_ < 2) return;
@@ -1255,7 +1242,7 @@ void ASM::attemptReplicaExchange(long local_step) {
   if(comm.Get_rank() == 0 && plumed.multi_sim_comm.Get_rank() == 0) {
     const long iter = local_step / long(REX_period_);
     // Lower-partner index alternates: iter odd -> (0,1),(2,3),... ;
-    // iter even -> (1,2),(3,4),... (matches sander parity in 0-based form).
+    // iter even -> (1,2),(3,4),...
     const unsigned phase = unsigned(1 - (iter & 1));
     for(unsigned i=phase; i+1<nnodes_; i+=2) {
       const double Eii   = biasEnergyAt(i,   cv_by_node[i]);
@@ -1313,10 +1300,8 @@ void ASM::attemptReplicaExchange(long local_step) {
     reparametrizeLinear();
   }
 
-  // Re-route per-step .dat output to the current node's file. Sander does this
-  // unconditionally on every REX call (close at asm.F90:1044, assign_dat_file
-  // at 1093); we only act when this rank actually moved, since reopening the
-  // same file in append mode is otherwise a no-op.
+  // Re-route per-step .dat output to the current node's file when this rank
+  // actually moved. Reopening the same file in append mode would be a no-op.
   if(node_ != old_node) {
     if(dat_stream_.is_open()) dat_stream_.close();
     openOutputFiles();
@@ -1326,7 +1311,6 @@ void ASM::attemptReplicaExchange(long local_step) {
 double ASM::scaleDpos(double x) const {
   // Exponential damping that prevents node-position inversions: the move
   // is throttled as |x| approaches the gap to the relevant neighbour.
-  // (sander scale_dpos at asm.F90:627-636.)
   if(node_ == 0 || node_ + 1 >= nnodes_) return x;
   const double gap_right = pos_[node_+1] - pos_[node_];
   const double gap_left  = pos_[node_]   - pos_[node_-1];
@@ -1351,8 +1335,7 @@ void ASM::computeTangentsFD() {
 }
 
 void ASM::normaliseTangentLocal() {
-  // sander normalize_M: n -> Minv·n / sqrt(n^T Minv Minv·n)? Actually sander
-  // computes n -> n / ||n||_Minv where ||v||_Minv^2 = v^T Minv v.
+  // n -> n / ||n||_Minv where ||v||_Minv^2 = v^T Minv v.
   const double L = lenM(n_vec_[node_], Minv_[node_]);
   if(L > 0.0) {
     for(unsigned k=0; k<ncv_; ++k) n_vec_[node_][k] /= L;
@@ -1360,10 +1343,9 @@ void ASM::normaliseTangentLocal() {
 }
 
 void ASM::updateBLocal() {
-  // sander update_B (asm.F90:974-994):
-  //   Minvn = Minv · n
-  //   S_ij  = Minvn_i * Minvn_j      (outer product)
-  //   B = S*(K_l - K_d) + Minv*K_d
+  // Minvn = Minv · n
+  // S_ij  = Minvn_i * Minvn_j      (outer product)
+  // B = S*(K_l - K_d) + Minv*K_d
   std::vector<double> Minvn;
   matVecPacked(Minv_[node_], n_vec_[node_], Minvn);
 
@@ -1380,11 +1362,11 @@ void ASM::updateBLocal() {
 }
 
 void ASM::reparametrizeLinear() {
-  // sander reparameterize_linear at asm.F90:1189-1268. Order: gather, unwrap
-  // periodic CVs, scale K_l by old length^2, recompute arc lengths and
-  // string_length_, divide K_l back by new length^2, redistribute non-
-  // terminal nodes onto the new equal-step lattice, allgather updated
-  // string + pos, fit smoothing spline, extract tangent, normalise, rebuild B.
+  // Order: gather, unwrap periodic CVs, scale K_l by old length^2,
+  // recompute arc lengths and string_length_, divide K_l back by new
+  // length^2, redistribute non-terminal nodes onto the new equal-step
+  // lattice, allgather updated string + pos, fit smoothing spline,
+  // extract tangent, normalise, rebuild B.
   gatherStringAcrossReplicas();
   toContinuousString();
 
@@ -1440,8 +1422,8 @@ void ASM::update() {
   const long local_step = getStep() + step0_ - long(preparation_steps_) + 1;
 
   // local_step > 0 excludes a phantom local_step=0 production tick that
-  // has no sander equivalent (would otherwise fire string motion / REX /
-  // accumulators before any real production step has run).
+  // would otherwise fire string motion / REX / accumulators before any
+  // real production step has run.
   if(string_move_ && local_step > 0 && local_step >= start_step_
      && long(local_step) % long(string_move_period_) == 0) {
 
@@ -1498,7 +1480,7 @@ void ASM::calculate() {
   if(first_calculate_) {
     cacheMasses();
 
-    // 1. Initial metric sample. (sander asm.F90:301-303.)
+    // 1. Initial metric sample.
     //    On restart we already have a saved Mav from the checkpoint and
     //    must not overwrite it with a one-step sample. With read_M and a
     //    guess file holding Minv we seed Mav from the file's per-node Minv.
@@ -1522,10 +1504,9 @@ void ASM::calculate() {
     // 2. Initial string positions:
     //    - on restart, string_[node_] was loaded from the checkpoint.
     //    - with a guess file: each replica seeds string_[node_] from the
-    //      guess (interpolated to nnodes_ if the file has a different
-    //      point count). Sander uses inv(mean_replicas(Mav)) as a single
-    //      consistent interpolation metric (asm.F90:388-391); we do the
-    //      same so all replicas produce the same resampled string.
+    //      guess (interpolated to nnodes_ if the file has a different point
+    //      count). The interpolation metric is inv(mean_replicas(Mav)) so
+    //      every replica produces the same resampled string.
     //    - otherwise: each replica's current ARG values become its node.
     if(!restarted_) {
       if(!guess_string_.empty()) {
@@ -1550,7 +1531,6 @@ void ASM::calculate() {
     // 4. Default K_l auto-tuning if user did not supply force_constant_l.
     //    Must run before writeParams so force_constants.dat row 0 reflects
     //    the actual initial K_l, and before updateBLocal so B is consistent.
-    //    (sander order: asm.F90:317-324.)
     if(K_l_local_ <= 0.0) {
       const double delta = string_length_ / double(nnodes_-1);
       K_l_local_ = RT_ / (0.25 * delta * delta);
@@ -1585,11 +1565,11 @@ void ASM::calculate() {
 
   const long local_step = getStep() + step0_ - long(preparation_steps_) + 1;
 
-  // 1. Local metric sample (this step) — sander asm.F90:541.
+  // 1. Local metric sample (this step).
   std::vector<double> M_now;
   if(string_move_ && !read_M_) buildLocalMetric(M_now);
 
-  // 2. Apply harmonic force on the input ARGs.  sander add_force_ld:
+  // 2. Apply harmonic force on the input ARGs:
   //      F_i = -force_scale * (B[node_] · diff(CV - string[node_]))_i
   //      energy = 0.5 * force_scale * diff^T B diff
   std::vector<double> dCV;
@@ -1606,7 +1586,7 @@ void ASM::calculate() {
   setBias(force_scale_ * ene);
   val_force2_->set(totf2);
 
-  // 3. EMA-update Mav and refresh Minv.   sander asm.F90:541-545.
+  // 3. EMA-update Mav and refresh Minv.
   if(string_move_ && !read_M_) {
     auto& Mav = Mav_[node_];
     for(unsigned k=0; k<msize_; ++k)
@@ -1632,7 +1612,7 @@ void ASM::calculate() {
     return;
   }
 
-  // dz_tmp: orthogonal displacement, sander asm.F90:557-559.
+  // dz_tmp: orthogonal displacement.
   //   tangent dot:   t = dCV · (Minv · n_vec)  using current Minv
   //   dz_tmp_i = K_d * (dCV_i - n_vec_i * t)
   std::vector<double> Minvn;
@@ -1642,7 +1622,7 @@ void ASM::calculate() {
   std::vector<double> dz_tmp(ncv_, 0.0);
   for(unsigned k=0; k<ncv_; ++k) dz_tmp[k] = K_d_ * (dCV[k] - n_vec_[node_][k]*tdot);
 
-  // dpos_tmp / sigma2 EMA / dK_tmp — sander asm.F90:563-583.
+  // dpos_tmp / sigma2 EMA / dK_tmp.
   const double delta = string_length_ / double(nnodes_-1);
   const double pos_target = delta*double(node_) - pos_[node_];
   const double sigma2_target = 0.25 * delta * delta;

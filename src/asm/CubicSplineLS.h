@@ -17,16 +17,13 @@
 
 /*
    CubicSplineLS — least-squares smoothing cubic splines for the ASM action.
-   Direct port of Amber sander's asm_splines_utilities.F90; the algorithm and
-   boundary handling are deliberately preserved verbatim so that the PLUMED
-   port reproduces sander's numerical behaviour.
 
    A spline over n+1 reference points produces n cubic segments. Each segment
    is stored as 5 doubles { x_i, a, b, c, d } so that on segment i:
        s(x) = a*(x-x_i)^3 + b*(x-x_i)^2 + c*(x-x_i) + d,   x in [x_i, x_{i+1}].
    Below x_0 (segment 0) the spline extrapolates linearly using s'(x_0); above
    the upper boundary (computed via splineMax) the spline extrapolates linearly
-   using s'(x_max) — natural-cubic-spline boundary behaviour, matching sander.
+   using s'(x_max) — natural-cubic-spline boundary behaviour.
 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */
 
 #ifndef __PLUMED_asm_CubicSplineLS_h
@@ -51,7 +48,6 @@ namespace cubic_spline_detail {
 /// Upper-boundary x of the spline. For natural cubic splines the second
 /// derivative is zero at the upper endpoint; the formula recovers the data
 /// point x_{n} from the coefficients of segment n-1.
-/// (sander asm_splines_utilities.F90:59-73)
 inline double splineMax(const Spline1D& sp) {
   plumed_assert(!sp.empty());
   const auto& last = sp.back();
@@ -63,8 +59,8 @@ inline double splineMax(const Spline1D& sp) {
   return 2.0*last[0] - sp[sp.size()-2][0];
 }
 
-/// Find the segment index such that x lies in [x_i, x_{i+1}). Mirrors the
-/// sander while-loop: walks back from the end until x >= coef(idx,1).
+/// Find the segment index such that x lies in [x_i, x_{i+1}). Walks back
+/// from the end until x >= coef(idx,1).
 inline std::size_t findSegment(const Spline1D& sp, double x) {
   std::size_t idx = sp.size() - 1;
   while(idx > 0 && x < sp[idx][0]) --idx;
@@ -74,7 +70,7 @@ inline std::size_t findSegment(const Spline1D& sp, double x) {
 }  // namespace cubic_spline_detail
 
 /// Evaluate spline at x. Linear extrapolation outside the spline's x-range,
-/// using the slope at the nearest endpoint. (sander spline_value at line 11.)
+/// using the slope at the nearest endpoint.
 inline double splineValue(double x, const Spline1D& sp) {
   using namespace cubic_spline_detail;
   plumed_assert(!sp.empty());
@@ -94,7 +90,7 @@ inline double splineValue(double x, const Spline1D& sp) {
   return sp[idx][1]*dx*dx*dx + sp[idx][2]*dx*dx + sp[idx][3]*dx + sp[idx][4];
 }
 
-/// Evaluate spline derivative at x. (sander spline_der at line 77.)
+/// Evaluate spline derivative at x.
 inline double splineDer(double x, const Spline1D& sp) {
   using namespace cubic_spline_detail;
   plumed_assert(!sp.empty());
@@ -103,7 +99,7 @@ inline double splineDer(double x, const Spline1D& sp) {
   return sp[idx][1]*3.0*dx*dx + sp[idx][2]*2.0*dx + sp[idx][3];
 }
 
-/// ND wrappers. (sander spline_value_ND / spline_der_ND, lines 205, 233.)
+/// ND wrappers.
 inline std::vector<double> splineValueND(double x, const SplineND& sp) {
   std::vector<double> out(sp.size());
   for(std::size_t i=0; i<sp.size(); ++i) out[i] = splineValue(x, sp[i]);
@@ -118,7 +114,6 @@ inline std::vector<double> splineDerND(double x, const SplineND& sp) {
 /// Build the SplineMatrix M (n×n) such that the second-derivative vector
 /// (m = My) of the natural cubic spline through equally-spaced points
 /// {x_i = x_0 + i*h} is a linear function of the y values.
-/// Direct port of sander's SplineMatrix (line 366-399).
 inline Matrix<double> splineMatrix(unsigned n, double h) {
   static constexpr double lambda = 1.31695789692482;
   Matrix<double> M(n,n);
@@ -128,10 +123,6 @@ inline Matrix<double> splineMatrix(unsigned n, double h) {
 
   const unsigned m = n - 2;
   // X (m×m) — analytic inverse of the tridiagonal natural-spline matrix.
-  // 0-based i,j here ↔ sander's 1-based I,J = i+1,j+1.
-  // (1 - 2*iand(I+J,1)) → sgn(I+J) = sgn(i+j).
-  // n-1-|J-I| → n-1-|j-i|.
-  // n-1-I-J → n-3-i-j.
   Matrix<double> X(m,m);
   const double denom = 2.0*std::sinh(lambda)*std::sinh(double(n-1)*lambda);
   for(unsigned i=0; i<m; ++i) {
@@ -163,7 +154,7 @@ inline Matrix<double> splineMatrix(unsigned n, double h) {
 
 /// Least-squares cubic-spline fit through (a_i, b_i) data, returning a spline
 /// with `coef.size()` segments over an equally-spaced lattice spanning the
-/// data's x-range. Direct port of CubicSplinesFit (sander line 267-335).
+/// data's x-range.
 inline void cubicSplinesFit(const std::vector<double>& a,
                             const std::vector<double>& b,
                             Spline1D& coef) {
@@ -239,7 +230,7 @@ inline void cubicSplinesFit(const std::vector<double>& a,
     Mval[i] = s;
   }
 
-  // Pack into segment coefficients (1-based sander → 0-based here).
+  // Pack into segment coefficients.
   for(unsigned i=0; i<nseg; ++i) {
     coef[i][0] = x[i];
     coef[i][1] = (Mval[i+1] - Mval[i]) / (6.0*h);
@@ -249,7 +240,7 @@ inline void cubicSplinesFit(const std::vector<double>& a,
   }
 }
 
-/// ND wrapper: y is [d][np]. coef is [d][nseg]. (sander CubicSplinesFitND.)
+/// ND wrapper: y is [d][np]. coef is [d][nseg].
 inline void cubicSplinesFitND(const std::vector<double>& a,
                               const std::vector<std::vector<double>>& y,
                               SplineND& coef) {
