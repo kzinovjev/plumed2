@@ -54,6 +54,11 @@ class ASM :
   public ActionWithValue,
   public ActionWithArguments {
 private:
+  // EMA damping for mean_dx / mean_sigma2 accumulators, and the number of
+  // settle steps before dK starts being added to the K_l adaptation.
+  static constexpr double EMA_DAMPING = 0.01;
+  static constexpr long   EMA_SETTLE_STEPS = 99;
+
   // -------- topology (0-based) ------------------------------------------
   unsigned ncv     = 0;
   unsigned nnodes  = 0;
@@ -1532,8 +1537,10 @@ void ASM::calculate() {
     //    Must run before writeParams so force_constants.dat row 0 reflects
     //    the actual initial K_l, and before updateBLocal so B is consistent.
     if(K_l_local <= 0.0) {
+      // K_l = RT / (Δ/2)^2 where Δ is the inter-node spacing.
       const double delta = string_length / double(nnodes-1);
-      K_l_local = RT / (0.25 * delta * delta);
+      const double half_delta = 0.5 * delta;
+      K_l_local = RT / (half_delta * half_delta);
       for(auto& k : K_l) k = K_l_local;
     }
     if(K_d <= 0.0) {
@@ -1637,10 +1644,10 @@ void ASM::calculate() {
     mean_dx     = 0.0;
     mean_sigma2 = dpos_tmp * dpos_tmp;
   }
-  mean_dx     = 0.99*mean_dx     + 0.01*dpos_tmp;
-  mean_sigma2 = 0.99*mean_sigma2 + 0.01*dpos_tmp*dpos_tmp;
+  mean_dx     = (1.0 - EMA_DAMPING)*mean_dx     + EMA_DAMPING*dpos_tmp;
+  mean_sigma2 = (1.0 - EMA_DAMPING)*mean_sigma2 + EMA_DAMPING*dpos_tmp*dpos_tmp;
   double dK_tmp = 0.0;
-  if(local_step >= first_evol_step + 99 && mean_sigma2 > 0.0) {
+  if(local_step >= first_evol_step + EMA_SETTLE_STEPS && mean_sigma2 > 0.0) {
     dK_tmp = RT/sigma2_target - RT/mean_sigma2
            + force_kappa * mean_dx * mean_dx;
   }
