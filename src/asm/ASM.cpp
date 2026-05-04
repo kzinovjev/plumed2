@@ -123,7 +123,10 @@ private:
   std::string restart_filename;      // file to read on RESTART YES
   std::ofstream dat_stream;          // {node}.dat — per-step append
   std::vector<long> snapshot_steps;  // history for convergence.dat
-  bool  first_calculate = true;
+  // Lifecycle: ColdStart from construction, Restarted after readCheckpoint(),
+  // Production once the first calculate() has run its init block.
+  enum class Phase { ColdStart, Restarted, Production };
+  Phase phase = Phase::ColdStart;
   bool  outputs_opened  = false;
   std::vector<double> dz_tmp_last;   // last per-step dz (for write_dat)
 
@@ -242,7 +245,6 @@ private:
 
   // first-call guard for one-time work in reparametrizeLinear
   bool first_reparametrize = true;
-  bool restarted           = false;  // set by readCheckpoint(); skips cold-start init
   std::vector<double> L;            // arc lengths to each node (rebuilt every reparam)
 };
 
@@ -1170,7 +1172,7 @@ void ASM::readCheckpoint() {
   // reproduces saved_local_step under the local_step formula.
   step0 = saved_local_step + long(preparation_steps) - 1;
   first_reparametrize = false;     // skip the equal-spacing pos initialiser
-  restarted = true;                // skip cold-start metric/string init in calculate()
+  phase = Phase::Restarted;        // skip cold-start metric/string init in calculate()
   log.printf("  ASM RESTART: resumed at local_step=%ld from %s\n",
              saved_local_step, fname.c_str());
 }
@@ -1424,7 +1426,7 @@ void ASM::reparametrizeLinear() {
 }
 
 void ASM::update() {
-  if(first_calculate) return;        // first call to update() comes before calculate's init
+  if(phase != Phase::Production) return;   // first update() arrives before calculate's init
   const long local_step = getStep() + step0 - long(preparation_steps) + 1;
 
   // local_step > 0 excludes a phantom local_step=0 production tick that
@@ -1483,14 +1485,15 @@ void ASM::update() {
 }
 
 void ASM::calculate() {
-  if(first_calculate) {
+  if(phase != Phase::Production) {
+    const bool from_restart = (phase == Phase::Restarted);
     cacheMasses();
 
     // 1. Initial metric sample.
     //    On restart we already have a saved Mav from the checkpoint and
     //    must not overwrite it with a one-step sample. With read_M and a
     //    guess file holding Minv we seed Mav from the file's per-node Minv.
-    if(read_M && !guess_Minv.empty() && !restarted) {
+    if(read_M && !guess_Minv.empty() && !from_restart) {
       // Pick the guess-Minv slot matching this node — interpolate when the
       // guess has a different point count, otherwise direct copy.
       if(guess_Minv.size() == nnodes) {
@@ -1503,7 +1506,7 @@ void ASM::calculate() {
       }
       invertPacked(Minv[node], Mav[node]);
     } else {
-      if(!read_M && !restarted) buildLocalMetric(Mav[node]);
+      if(!read_M && !from_restart) buildLocalMetric(Mav[node]);
       invertPacked(Mav[node], Minv[node]);
     }
 
@@ -1514,7 +1517,7 @@ void ASM::calculate() {
     //      count). The interpolation metric is inv(mean_replicas(Mav)) so
     //      every replica produces the same resampled string.
     //    - otherwise: each replica's current ARG values become its node.
-    if(!restarted) {
+    if(!from_restart) {
       if(!guess_string.empty()) {
         std::vector<std::vector<double>> resampled(nnodes,
                                                    std::vector<double>(ncv, 0.0));
@@ -1555,7 +1558,7 @@ void ASM::calculate() {
     // the existing on-disk filenames.
     if(!outputs_opened) { openOutputFiles(); outputs_opened = true; }
     const long lstep0 =
-      restarted ? (getStep() + step0 - long(preparation_steps) + 1) : 0L;
+      from_restart ? (getStep() + step0 - long(preparation_steps) + 1) : 0L;
     if(is_server) {
       writeSnapshot(lstep0);
       writeParams();
@@ -1566,9 +1569,9 @@ void ASM::calculate() {
     // Cold-start 0.ck
     // Skipped on restart: the file we just read from would only
     // be re-emitted.
-    if(!restarted) writeCheckpoint(0);
+    if(!from_restart) writeCheckpoint(0);
 
-    first_calculate = false;
+    phase = Phase::Production;
   }
 
   const long local_step = getStep() + step0 - long(preparation_steps) + 1;
