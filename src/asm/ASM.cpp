@@ -803,14 +803,13 @@ void ASM::buildArcLengths() {
   L.assign(nnodes, 0.0);
   std::vector<double> dx(ncv);
   Matrix<double> Mavg(ncv, ncv);
-  auto& Mv = Mavg.getVector();
   for(unsigned i=1; i<nnodes; ++i) {
     for(unsigned k=0; k<ncv; ++k) {
       dx[k] = getPntrToArgument(k)->difference(nodes[i-1].cv[k], nodes[i].cv[k]);
     }
-    const auto& Av = nodes[i-1].Minv.getVector();
-    const auto& Bv = nodes[i  ].Minv.getVector();
-    for(unsigned k=0; k<ncv*ncv; ++k) Mv[k] = 0.5*(Av[k] + Bv[k]);
+    for(unsigned r=0; r<ncv; ++r)
+      for(unsigned c=0; c<ncv; ++c)
+        Mavg(r,c) = 0.5*(nodes[i-1].Minv(r,c) + nodes[i].Minv(r,c));
     L[i] = L[i-1] + lenM(dx, Mavg);
   }
   string_length = L[nnodes-1];
@@ -1680,11 +1679,12 @@ void ASM::calculate() {
 
   // 3. EMA-update Mav and refresh Minv.
   if(string_move && !read_M) {
-    auto& Mv = nodes[node].Mav.getVector();
-    const auto& Nv = M_now.getVector();
+    auto& Mav_node = nodes[node].Mav;
     const double a = 1.0 - Mav_damp, b = Mav_damp;
-    for(unsigned k=0; k<ncv*ncv; ++k) Mv[k] = a*Mv[k] + b*Nv[k];
-    if(Invert(nodes[node].Mav, nodes[node].Minv) != 0) {
+    for(unsigned i=0; i<ncv; ++i)
+      for(unsigned j=0; j<ncv; ++j)
+        Mav_node(i,j) = a*Mav_node(i,j) + b*M_now(i,j);
+    if(Invert(Mav_node, nodes[node].Minv) != 0) {
       plumed_merror("ASM: failed to invert metric tensor");
     }
     normaliseTangentLocal();
