@@ -179,10 +179,6 @@ private:
   void cacheMasses();
   void buildLocalMetric(Matrix<double>& Mout);
 
-  // matrix-vector product:  out = M · v
-  void matVec(const Matrix<double>&      M,
-              const std::vector<double>& v,
-              std::vector<double>&       out) const;
   // metric-weighted dot:  a^T M b
   double dotProductM(const std::vector<double>& a,
                      const std::vector<double>& b,
@@ -194,6 +190,14 @@ private:
   void cvDiff(unsigned i, std::vector<double>& dCV) const;
 
   // multi-replica state synchronisation
+  // Plain Allgather over multi_sim_comm + Bcast within comm, with the
+  // recv buffer re-indexed from rank-keyed to node-keyed using the cached
+  // node_to_rank[]. Caller supplies a uniform-size flat payload and gets
+  // recv_by_node[node] back. Relies on node_to_rank[] being consistent on
+  // every rank at the moment of the call (true between REX swaps and after
+  // applyRexSwaps, which updates the array identically on every rank).
+  void nodeAwareAllgather(const std::vector<double>&        send,
+                          std::vector<std::vector<double>>& recv_by_node) const;
   void gatherStringAcrossReplicas();
   // Each replica computes B only for its own node in updateBLocal; the
   // REX bias-energy probe needs B[i] for every i
@@ -583,26 +587,12 @@ void ASM::buildLocalMetric(Matrix<double>& Mout) {
   }
 }
 
-void ASM::matVec(const Matrix<double>&      M,
-                 const std::vector<double>& v,
-                 std::vector<double>&       out) const {
-  out.assign(ncv, 0.0);
-  for(unsigned i=0; i<ncv; ++i) {
-    double s = 0.0;
-    for(unsigned j=0; j<ncv; ++j) s += M(i,j) * v[j];
-    out[i] = s;
-  }
-}
 double ASM::dotProductM(const std::vector<double>& a,
                         const std::vector<double>& b,
                         const Matrix<double>&      M) const {
-  double s = 0.0;
-  for(unsigned i=0; i<ncv; ++i) {
-    double row = 0.0;
-    for(unsigned j=0; j<ncv; ++j) row += M(i,j) * b[j];
-    s += a[i] * row;
-  }
-  return s;
+  std::vector<double> Mb;
+  mult(M, b, Mb);
+  return dotProduct(a, Mb);
 }
 double ASM::lenM(const std::vector<double>& v,
                  const Matrix<double>&      M) const {
@@ -618,39 +608,46 @@ void ASM::cvDiff(unsigned i, std::vector<double>& dCV) const {
   }
 }
 
-void ASM::gatherStringAcrossReplicas() {
-  // After REX, rank ≠ node — each rank embeds its own node at slot 0 of
-  // the send buffer so the receiver places the payload at the slot for
-  // the node, not the rank. K_l travels in the same pack to keep the
-  // remap atomic.
-  const unsigned pack_n = 1u + ncv + ncv*ncv + 2u;
-  std::vector<double> sendbuf(pack_n);
-  unsigned p = 0;
-  sendbuf[p++] = double(node);
-  for(unsigned k=0; k<ncv; ++k)   sendbuf[p++] = nodes[node].cv[k];
-  {
-    const auto& Mv = nodes[node].Mav.getVector();
-    for(unsigned k=0; k<ncv*ncv; ++k) sendbuf[p++] = Mv[k];
-  }
-  sendbuf[p++] = nodes[node].pos;
-  sendbuf[p++] = nodes[node].K_l;
-
-  std::vector<double> recvbuf(pack_n*nnodes, 0.0);
+void ASM::nodeAwareAllgather(const std::vector<double>&        send,
+                             std::vector<std::vector<double>>& recv_by_node) const {
+  const unsigned pn = send.size();
+  std::vector<double> recvbuf(pn * nnodes);
   if(comm.Get_rank() == 0) {
-    plumed.multi_sim_comm.Allgather(sendbuf, recvbuf);
+    plumed.multi_sim_comm.Allgather(send, recvbuf);
   }
   comm.Bcast(recvbuf, 0);
-
+  // node_to_rank[i] = rank that owns node i, so rank r owns rank_to_node[r].
+  std::vector<unsigned> rank_to_node(nnodes);
+  for(unsigned i=0; i<nnodes; ++i) rank_to_node[node_to_rank[i]] = i;
+  recv_by_node.assign(nnodes, std::vector<double>(pn));
   for(unsigned r=0; r<nnodes; ++r) {
-    const double* rp = &recvbuf[r*pack_n];
-    const unsigned n = unsigned(rp[0]);
-    if(n >= nnodes) continue;
-    unsigned q = 1;
-    for(unsigned k=0; k<ncv; ++k) nodes[n].cv[k] = rp[q++];
+    const unsigned n = rank_to_node[r];
+    std::copy(recvbuf.begin()+r*pn, recvbuf.begin()+(r+1)*pn,
+              recv_by_node[n].begin());
+  }
+}
+
+void ASM::gatherStringAcrossReplicas() {
+  // K_l travels in the same pack as cv/Mav/pos so the cluster-wide remap
+  // is atomic against any state read between two reparam-style gathers.
+  std::vector<double> send;
+  send.reserve(ncv + ncv*ncv + 2u);
+  for(unsigned k=0; k<ncv; ++k) send.push_back(nodes[node].cv[k]);
+  for(double v : nodes[node].Mav.getVector()) send.push_back(v);
+  send.push_back(nodes[node].pos);
+  send.push_back(nodes[node].K_l);
+
+  std::vector<std::vector<double>> by_node;
+  nodeAwareAllgather(send, by_node);
+
+  for(unsigned n=0; n<nnodes; ++n) {
+    const auto& p = by_node[n];
+    unsigned q = 0;
+    for(unsigned k=0; k<ncv; ++k) nodes[n].cv[k] = p[q++];
     auto& Mv = nodes[n].Mav.getVector();
-    for(unsigned k=0; k<ncv*ncv; ++k) Mv[k] = rp[q++];
-    nodes[n].pos = rp[q++];
-    nodes[n].K_l = rp[q++];
+    for(unsigned k=0; k<ncv*ncv; ++k) Mv[k] = p[q++];
+    nodes[n].pos = p[q++];
+    nodes[n].K_l = p[q++];
   }
   for(unsigned i=0; i<nnodes; ++i) {
     if(Invert(nodes[i].Mav, nodes[i].Minv) != 0) {
@@ -660,31 +657,15 @@ void ASM::gatherStringAcrossReplicas() {
 }
 
 void ASM::gatherBAcrossReplicas() {
-  // Per-rank packet: node(double) + B[ncv*ncv]. Each replica owns one
-  // node's B (computed in updateBLocal); broadcast so biasEnergyAt(i,.)
-  // works for every i during attemptReplicaExchange. Without this the
-  // four-energy probe sees B[i]=0 for every node not owned by rank 0
-  // of multi_sim_comm and effectively always-accepts those swaps.
-  const unsigned pack_n = 1u + ncv*ncv;
-  std::vector<double> sendbuf(pack_n);
-  sendbuf[0] = double(node);
-  {
-    const auto& Bv = nodes[node].B.getVector();
-    for(unsigned k=0; k<ncv*ncv; ++k) sendbuf[1+k] = Bv[k];
-  }
-
-  std::vector<double> recvbuf(pack_n*nnodes, 0.0);
-  if(comm.Get_rank() == 0) {
-    plumed.multi_sim_comm.Allgather(sendbuf, recvbuf);
-  }
-  comm.Bcast(recvbuf, 0);
-
-  for(unsigned r=0; r<nnodes; ++r) {
-    const double* rp = &recvbuf[r*pack_n];
-    const unsigned n = unsigned(rp[0]);
-    if(n >= nnodes) continue;
+  // Each replica owns one node's B (computed in updateBLocal); broadcast so
+  // biasEnergyAt(i,.) works for every i during attemptReplicaExchange.
+  // Without this the four-energy probe sees B[i]=0 for every node not owned
+  // by rank 0 of multi_sim_comm and effectively always-accepts those swaps.
+  std::vector<std::vector<double>> by_node;
+  nodeAwareAllgather(nodes[node].B.getVector(), by_node);
+  for(unsigned n=0; n<nnodes; ++n) {
     auto& Bv = nodes[n].B.getVector();
-    for(unsigned k=0; k<ncv*ncv; ++k) Bv[k] = rp[1+k];
+    Bv = by_node[n];
   }
 }
 
@@ -1000,40 +981,30 @@ void ASM::gatherAccumulatorsByNode(
     std::vector<double>& dK_full,
     std::vector<double>& mdx_full,
     std::vector<double>& ms2_full) const {
-  // Each rank stamps node into slot 0 so the receiver demultiplexes by
-  // node, not by rank — required because rank != node after any REX swap.
-  // Mirrors the accumulator-pack subset of attemptReplicaExchange.
-  const unsigned pack_n = 1u + ncv + 4u;
-  std::vector<double> sendbuf(pack_n);
-  unsigned p = 0;
-  sendbuf[p++] = double(node);
-  for(unsigned k=0; k<ncv; ++k) sendbuf[p++] = dz[k];
-  sendbuf[p++] = dpos;
-  sendbuf[p++] = dK;
-  sendbuf[p++] = mean_dx;
-  sendbuf[p++] = mean_sigma2;
+  std::vector<double> send;
+  send.reserve(ncv + 4u);
+  for(unsigned k=0; k<ncv; ++k) send.push_back(dz[k]);
+  send.push_back(dpos);
+  send.push_back(dK);
+  send.push_back(mean_dx);
+  send.push_back(mean_sigma2);
 
-  std::vector<double> recvbuf(pack_n*nnodes, 0.0);
-  if(comm.Get_rank() == 0) {
-    plumed.multi_sim_comm.Allgather(sendbuf, recvbuf);
-  }
-  comm.Bcast(recvbuf, 0);
+  std::vector<std::vector<double>> by_node;
+  nodeAwareAllgather(send, by_node);
 
   dz_full  .assign(nnodes, std::vector<double>(ncv, 0.0));
   dpos_full.assign(nnodes, 0.0);
   dK_full  .assign(nnodes, 0.0);
   mdx_full .assign(nnodes, 0.0);
   ms2_full .assign(nnodes, 0.0);
-  for(unsigned r=0; r<nnodes; ++r) {
-    const double* rp = &recvbuf[r*pack_n];
-    const unsigned n = unsigned(rp[0]);
-    if(n >= nnodes) continue;
-    unsigned q = 1;
-    for(unsigned k=0; k<ncv; ++k) dz_full[n][k] = rp[q++];
-    dpos_full[n] = rp[q++];
-    dK_full  [n] = rp[q++];
-    mdx_full [n] = rp[q++];
-    ms2_full [n] = rp[q++];
+  for(unsigned n=0; n<nnodes; ++n) {
+    const auto& p = by_node[n];
+    unsigned q = 0;
+    for(unsigned k=0; k<ncv; ++k) dz_full[n][k] = p[q++];
+    dpos_full[n] = p[q++];
+    dK_full  [n] = p[q++];
+    mdx_full [n] = p[q++];
+    ms2_full [n] = p[q++];
   }
 }
 
@@ -1303,47 +1274,33 @@ void ASM::attemptReplicaExchange(long local_step) {
 
   const unsigned old_node = node;
 
-  // ---- Allgather per-rank packet --------------------------------------
-  // packet layout (per rank): node(double), cv[ncv], dz[ncv], dpos, dK,
-  // mean_dx, mean_sigma2  →  1 + 2*ncv + 4 doubles.
-  const unsigned pack_n = 1 + 2u*ncv + 4u;
-  std::vector<double> sendbuf(pack_n);
-  unsigned p = 0;
-  sendbuf[p++] = double(node);
-  for(unsigned k=0; k<ncv; ++k) sendbuf[p++] = getArgument(k);
-  for(unsigned k=0; k<ncv; ++k) sendbuf[p++] = dz[k];
-  sendbuf[p++] = dpos;
-  sendbuf[p++] = dK;
-  sendbuf[p++] = mean_dx;
-  sendbuf[p++] = mean_sigma2;
+  // ---- Allgather per-rank packet (cv + dz + scalar accumulators) ------
+  std::vector<double> send;
+  send.reserve(2u*ncv + 4u);
+  for(unsigned k=0; k<ncv; ++k) send.push_back(getArgument(k));
+  for(unsigned k=0; k<ncv; ++k) send.push_back(dz[k]);
+  send.push_back(dpos);
+  send.push_back(dK);
+  send.push_back(mean_dx);
+  send.push_back(mean_sigma2);
 
-  std::vector<double> recvbuf(pack_n*nnodes, 0.0);
-  if(comm.Get_rank() == 0) {
-    plumed.multi_sim_comm.Allgather(sendbuf, recvbuf);
-  }
-  comm.Bcast(recvbuf, 0);
+  std::vector<std::vector<double>> by_node;
+  nodeAwareAllgather(send, by_node);
 
-  // ---- Reorder by node so [i] is the data of the rank currently at node i.
-  std::vector<unsigned> rank_of_node(nnodes, 0);
   std::vector<std::vector<double>> cv_by_node(nnodes, std::vector<double>(ncv));
   std::vector<std::vector<double>> dz_by_node(nnodes, std::vector<double>(ncv));
   std::vector<double> dpos_by_node(nnodes), dK_by_node(nnodes);
   std::vector<double> mdx_by_node(nnodes),  ms2_by_node(nnodes);
-  for(unsigned r=0; r<nnodes; ++r) {
-    const double* rp = &recvbuf[r*pack_n];
-    const unsigned n = unsigned(rp[0]);
-    if(n >= nnodes) continue;       // defensive; should never happen
-    rank_of_node[n] = r;
-    unsigned q = 1;
-    for(unsigned k=0; k<ncv; ++k) cv_by_node[n][k] = rp[q++];
-    for(unsigned k=0; k<ncv; ++k) dz_by_node[n][k] = rp[q++];
-    dpos_by_node[n] = rp[q++];
-    dK_by_node[n]   = rp[q++];
-    mdx_by_node[n]  = rp[q++];
-    ms2_by_node[n]  = rp[q++];
+  for(unsigned n=0; n<nnodes; ++n) {
+    const auto& p = by_node[n];
+    unsigned q = 0;
+    for(unsigned k=0; k<ncv; ++k) cv_by_node[n][k] = p[q++];
+    for(unsigned k=0; k<ncv; ++k) dz_by_node[n][k] = p[q++];
+    dpos_by_node[n] = p[q++];
+    dK_by_node[n]   = p[q++];
+    mdx_by_node[n]  = p[q++];
+    ms2_by_node[n]  = p[q++];
   }
-  // Update the cached node_to_rank from the freshly observed mapping.
-  for(unsigned i=0; i<nnodes; ++i) node_to_rank[i] = rank_of_node[i];
 
   // ---- Decide acceptance for alternating adjacent pairs ----------------
   // Only rank 0 of multi_sim_comm rolls; broadcast the decisions so every
@@ -1430,7 +1387,7 @@ void ASM::updateBLocal() {
   // S_ij  = Minvn_i * Minvn_j      (outer product)
   // B = S*(K_l - K_d) + Minv*K_d
   std::vector<double> Minvn;
-  matVec(nodes[node].Minv, nodes[node].n, Minvn);
+  mult(nodes[node].Minv, nodes[node].n, Minvn);
 
   Matrix<double>& Bn = nodes[node].B;
   const Matrix<double>& Mn = nodes[node].Minv;
@@ -1666,7 +1623,7 @@ void ASM::calculate() {
   std::vector<double> dCV;
   cvDiff(node, dCV);
   std::vector<double> B_dCV;
-  matVec(nodes[node].B, dCV, B_dCV);
+  mult(nodes[node].B, dCV, B_dCV);
   double ene = 0.0, totf2 = 0.0;
   for(unsigned k=0; k<ncv; ++k) {
     const double f = -force_scale * B_dCV[k];
@@ -1711,9 +1668,8 @@ void ASM::calculate() {
   //   tangent dot:   t = dCV · (Minv · n)  using current Minv
   //   dz_tmp_i = K_d * (dCV_i - n_i * t)
   std::vector<double> Minvn;
-  matVec(nodes[node].Minv, nodes[node].n, Minvn);
-  double tdot = 0.0;
-  for(unsigned k=0; k<ncv; ++k) tdot += dCV[k] * Minvn[k];
+  mult(nodes[node].Minv, nodes[node].n, Minvn);
+  const double tdot = dotProduct(dCV, Minvn);
   std::vector<double> dz_tmp(ncv, 0.0);
   for(unsigned k=0; k<ncv; ++k) dz_tmp[k] = K_d * (dCV[k] - nodes[node].n[k]*tdot);
 
