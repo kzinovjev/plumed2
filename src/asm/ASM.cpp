@@ -63,7 +63,6 @@ private:
   unsigned ncv     = 0;
   unsigned nnodes  = 0;
   unsigned node    = 0;
-  unsigned msize   = 0;             // ncv*(ncv+1)/2 — packed lower-tri size
   bool     is_terminal = false;
   bool     is_server   = false;     // node == 0
 
@@ -104,9 +103,9 @@ private:
   struct Node {
     std::vector<double> cv;        // size ncv  — CV-space coordinates
     std::vector<double> n;         // size ncv  — tangent
-    std::vector<double> Mav;       // size msize — packed lower-tri metric
-    std::vector<double> Minv;      // size msize
-    std::vector<double> B;         // size msize
+    std::vector<double> Mav;       // size ncv*ncv — full symmetric, row-major
+    std::vector<double> Minv;      // size ncv*ncv
+    std::vector<double> B;         // size ncv*ncv
     double pos = 0.0;
     double K_l = 0.0;
   };
@@ -173,23 +172,23 @@ private:
   void setBias(double e) { val_bias->set(e); }
 
   // metric helpers
+  // All metric tensors (Mav, Minv, B, the arguments below) are stored as
+  // full symmetric ncv*ncv matrices in row-major layout: M[i*ncv + j].
   void cacheMasses();
   void buildLocalMetric(std::vector<double>& Mout);
-  void packToMatrix(const std::vector<double>& packed, Matrix<double>& M) const;
-  void matrixToPacked(const Matrix<double>& M, std::vector<double>& packed) const;
-  void invertPacked(const std::vector<double>& packed, std::vector<double>& inv_packed) const;
+  void invertSym(const std::vector<double>& M, std::vector<double>& Minv) const;
 
-  // packed-symmetric matrix-vector product:  out = M_packed · v
-  void matVecPacked(const std::vector<double>& Mpacked,
-                    const std::vector<double>& v,
-                    std::vector<double>&       out) const;
-  // metric-weighted dot:  a^T M_packed b
+  // matrix-vector product:  out = M · v
+  void matVec(const std::vector<double>& M,
+              const std::vector<double>& v,
+              std::vector<double>&       out) const;
+  // metric-weighted dot:  a^T M b
   double dotProductM(const std::vector<double>& a,
                      const std::vector<double>& b,
-                     const std::vector<double>& Mpacked) const;
-  // metric-weighted norm:  sqrt(v^T M_packed v)
+                     const std::vector<double>& M) const;
+  // metric-weighted norm:  sqrt(v^T M v)
   double lenM(const std::vector<double>& v,
-              const std::vector<double>& Mpacked) const;
+              const std::vector<double>& M) const;
   // periodic-aware difference  (string_node_i - cv_i)
   void cvDiff(unsigned i, std::vector<double>& dCV) const;
 
@@ -204,11 +203,11 @@ private:
 
   // initial-guess support
   std::vector<std::vector<double>> guess_string;   // [ninit][ncv], empty if not used
-  std::vector<std::vector<double>> guess_Minv;     // [ninit][msize], populated only if read_M
+  std::vector<std::vector<double>> guess_Minv;     // [ninit][ncv*ncv], populated only if read_M
   void readGuessFile(const std::string& path);
   void interpolateLinear(const std::vector<std::vector<double>>& src,
                          std::vector<std::vector<double>>&       dst,
-                         const std::vector<double>&              metric_packed) const;
+                         const std::vector<double>&              metric) const;
 
   // string-method helpers
   void initStringFromCurrentCV();
@@ -379,7 +378,6 @@ ASM::ASM(const ActionOptions& ao):
   // ---- input CVs -------------------------------------------------------
   ncv = getNumberOfArguments();
   if(ncv < 1) error("ASM needs at least one input CV via ARG=...");
-  msize = ncv*(ncv+1)/2;
 
   // Atomic gradients on each ARG are required to assemble the metric.
   // turnOnDerivatives() populates Value::data with atom derivatives;
@@ -477,9 +475,9 @@ ASM::ASM(const ActionOptions& ao):
   for(auto& nd : nodes) {
     nd.cv  .assign(ncv,   0.0);
     nd.n   .assign(ncv,   0.0);
-    nd.Mav .assign(msize, 0.0);
-    nd.Minv.assign(msize, 0.0);
-    nd.B   .assign(msize, 0.0);
+    nd.Mav .assign(ncv*ncv, 0.0);
+    nd.Minv.assign(ncv*ncv, 0.0);
+    nd.B   .assign(ncv*ncv, 0.0);
   }
   dz.assign(ncv, 0.0);
 
@@ -566,70 +564,59 @@ void ASM::cacheMasses() {
   masses_cached = true;
 }
 
-void ASM::packToMatrix(const std::vector<double>& packed, Matrix<double>& M) const {
-  // Lower-triangular packed → full symmetric. Order: (0,0), (1,0),(1,1), ...
-  unsigned p = 0;
-  for(unsigned i=0; i<ncv; ++i) {
-    for(unsigned j=0; j<=i; ++j) {
-      M(i,j) = packed[p];
-      M(j,i) = packed[p];
-      ++p;
-    }
-  }
-}
-void ASM::matrixToPacked(const Matrix<double>& M, std::vector<double>& packed) const {
-  unsigned p = 0;
+void ASM::invertSym(const std::vector<double>& M, std::vector<double>& Minv_out) const {
+  // Round-trip through PLUMED's Matrix<double> for Invert(); the inputs and
+  // outputs are full symmetric ncv*ncv row-major.
+  Matrix<double> Mmat(ncv, ncv), Minv_mat(ncv, ncv);
   for(unsigned i=0; i<ncv; ++i)
-    for(unsigned j=0; j<=i; ++j) packed[p++] = M(i,j);
-}
-void ASM::invertPacked(const std::vector<double>& packed, std::vector<double>& inv_packed) const {
-  Matrix<double> M(ncv, ncv), Minv(ncv, ncv);
-  packToMatrix(packed, M);
-  const int rc = Invert(M, Minv);
-  if(rc != 0) {
+    for(unsigned j=0; j<ncv; ++j) Mmat(i,j) = M[i*ncv + j];
+  if(Invert(Mmat, Minv_mat) != 0) {
     plumed_merror("ASM: failed to invert metric tensor");
   }
-  matrixToPacked(Minv, inv_packed);
+  Minv_out.assign(ncv*ncv, 0.0);
+  for(unsigned i=0; i<ncv; ++i)
+    for(unsigned j=0; j<ncv; ++j) Minv_out[i*ncv + j] = Minv_mat(i,j);
 }
 
 void ASM::buildLocalMetric(std::vector<double>& Mout) {
   cacheMasses();
-  Mout.assign(msize, 0.0);
-  unsigned p = 0;
+  Mout.assign(ncv*ncv, 0.0);
+  // Symmetric build: compute the lower triangle and mirror.
   for(unsigned i=0; i<ncv; ++i) {
     for(unsigned j=0; j<=i; ++j) {
-      Mout[p++] = Value::projectionWithAtomWeights(*getPntrToArgument(i),
-                                                   *getPntrToArgument(j),
-                                                   inv_atom_mass_by_index);
+      const double v = Value::projectionWithAtomWeights(*getPntrToArgument(i),
+                                                        *getPntrToArgument(j),
+                                                        inv_atom_mass_by_index);
+      Mout[i*ncv + j] = v;
+      Mout[j*ncv + i] = v;
     }
   }
 }
 
-void ASM::matVecPacked(const std::vector<double>& Mpacked,
-                       const std::vector<double>& v,
-                       std::vector<double>&       out) const {
+void ASM::matVec(const std::vector<double>& M,
+                 const std::vector<double>& v,
+                 std::vector<double>&       out) const {
   out.assign(ncv, 0.0);
-  unsigned p = 0;
   for(unsigned i=0; i<ncv; ++i) {
-    for(unsigned j=0; j<=i; ++j) {
-      out[i] += Mpacked[p] * v[j];
-      if(j != i) out[j] += Mpacked[p] * v[i];
-      ++p;
-    }
+    double s = 0.0;
+    for(unsigned j=0; j<ncv; ++j) s += M[i*ncv + j] * v[j];
+    out[i] = s;
   }
 }
 double ASM::dotProductM(const std::vector<double>& a,
                         const std::vector<double>& b,
-                        const std::vector<double>& Mpacked) const {
-  std::vector<double> Mb;
-  matVecPacked(Mpacked, b, Mb);
+                        const std::vector<double>& M) const {
   double s = 0.0;
-  for(unsigned i=0; i<ncv; ++i) s += a[i]*Mb[i];
+  for(unsigned i=0; i<ncv; ++i) {
+    double row = 0.0;
+    for(unsigned j=0; j<ncv; ++j) row += M[i*ncv + j] * b[j];
+    s += a[i] * row;
+  }
   return s;
 }
 double ASM::lenM(const std::vector<double>& v,
-                 const std::vector<double>& Mpacked) const {
-  const double s = dotProductM(v, v, Mpacked);
+                 const std::vector<double>& M) const {
+  const double s = dotProductM(v, v, M);
   return s > 0.0 ? std::sqrt(s) : 0.0;
 }
 
@@ -646,12 +633,12 @@ void ASM::gatherStringAcrossReplicas() {
   // the send buffer so the receiver places the payload at the slot for
   // the node, not the rank. K_l travels in the same pack to keep the
   // remap atomic.
-  const unsigned pack_n = 1u + ncv + msize + 2u;
+  const unsigned pack_n = 1u + ncv + ncv*ncv + 2u;
   std::vector<double> sendbuf(pack_n);
   unsigned p = 0;
   sendbuf[p++] = double(node);
   for(unsigned k=0; k<ncv; ++k)   sendbuf[p++] = nodes[node].cv[k];
-  for(unsigned k=0; k<msize; ++k) sendbuf[p++] = nodes[node].Mav[k];
+  for(unsigned k=0; k<ncv*ncv; ++k) sendbuf[p++] = nodes[node].Mav[k];
   sendbuf[p++] = nodes[node].pos;
   sendbuf[p++] = nodes[node].K_l;
 
@@ -667,25 +654,25 @@ void ASM::gatherStringAcrossReplicas() {
     if(n >= nnodes) continue;
     unsigned q = 1;
     for(unsigned k=0; k<ncv; ++k)   nodes[n].cv[k] = rp[q++];
-    for(unsigned k=0; k<msize; ++k) nodes[n].Mav[k]    = rp[q++];
+    for(unsigned k=0; k<ncv*ncv; ++k) nodes[n].Mav[k]    = rp[q++];
     nodes[n].pos = rp[q++];
     nodes[n].K_l = rp[q++];
   }
   for(unsigned i=0; i<nnodes; ++i) {
-    invertPacked(nodes[i].Mav, nodes[i].Minv);
+    invertSym(nodes[i].Mav, nodes[i].Minv);
   }
 }
 
 void ASM::gatherBAcrossReplicas() {
-  // Per-rank packet: node(double) + B[msize]. Each replica owns one
+  // Per-rank packet: node(double) + B[ncv*ncv]. Each replica owns one
   // node's B (computed in updateBLocal); broadcast so biasEnergyAt(i,.)
   // works for every i during attemptReplicaExchange. Without this the
   // four-energy probe sees B[i]=0 for every node not owned by rank 0
   // of multi_sim_comm and effectively always-accepts those swaps.
-  const unsigned pack_n = 1u + msize;
+  const unsigned pack_n = 1u + ncv*ncv;
   std::vector<double> sendbuf(pack_n);
   sendbuf[0] = double(node);
-  for(unsigned k=0; k<msize; ++k) sendbuf[1+k] = nodes[node].B[k];
+  for(unsigned k=0; k<ncv*ncv; ++k) sendbuf[1+k] = nodes[node].B[k];
 
   std::vector<double> recvbuf(pack_n*nnodes, 0.0);
   if(comm.Get_rank() == 0) {
@@ -697,7 +684,7 @@ void ASM::gatherBAcrossReplicas() {
     const double* rp = &recvbuf[r*pack_n];
     const unsigned n = unsigned(rp[0]);
     if(n >= nnodes) continue;
-    for(unsigned k=0; k<msize; ++k) nodes[n].B[k] = rp[1+k];
+    for(unsigned k=0; k<ncv*ncv; ++k) nodes[n].B[k] = rp[1+k];
   }
 }
 
@@ -705,20 +692,20 @@ void ASM::gatherMavMeanInverted(std::vector<double>& Mtmpinv) const {
   // Sum each replica's nodes[node].Mav across multi_sim_comm, divide by nnodes,
   // then invert. Run on rank-0-of-comm and Bcast within comm so every rank
   // of a replica sees the same metric.
-  std::vector<double> send(msize), recv(msize*nnodes, 0.0);
-  for(unsigned k=0; k<msize; ++k) send[k] = nodes[node].Mav[k];
+  std::vector<double> send(ncv*ncv), recv(ncv*ncv*nnodes, 0.0);
+  for(unsigned k=0; k<ncv*ncv; ++k) send[k] = nodes[node].Mav[k];
   if(comm.Get_rank() == 0) {
     plumed.multi_sim_comm.Allgather(send, recv);
   }
   comm.Bcast(recv, 0);
-  std::vector<double> Mtmp(msize, 0.0);
+  std::vector<double> Mtmp(ncv*ncv, 0.0);
   for(unsigned i=0; i<nnodes; ++i) {
-    for(unsigned k=0; k<msize; ++k) Mtmp[k] += recv[i*msize + k];
+    for(unsigned k=0; k<ncv*ncv; ++k) Mtmp[k] += recv[i*ncv*ncv + k];
   }
   const double inv_n = 1.0 / double(nnodes);
   for(auto& x : Mtmp) x *= inv_n;
-  Mtmpinv.assign(msize, 0.0);
-  invertPacked(Mtmp, Mtmpinv);
+  Mtmpinv.assign(ncv*ncv, 0.0);
+  invertSym(Mtmp, Mtmpinv);
 }
 
 void ASM::readGuessFile(const std::string& path) {
@@ -726,8 +713,8 @@ void ASM::readGuessFile(const std::string& path) {
   //   line 1:    ninit (integer)
   //   following: ninit*ncv whitespace-separated doubles — each row is one
   //              point's CV vector.
-  //   if read_M: ninit*msize doubles for the per-point Minv (lower-tri
-  //              packed, same layout as Mav/Minv).
+  //   if read_M: ninit*ncv*ncv doubles for the per-point Minv — each point
+  //              is a full ncv×ncv symmetric matrix in row-major order.
   std::ifstream in(path);
   if(!in) error("ASM: cannot open GUESS_FILE '" + path + "'");
   unsigned ninit = 0;
@@ -744,9 +731,9 @@ void ASM::readGuessFile(const std::string& path) {
     }
   }
   if(read_M) {
-    guess_Minv.assign(ninit, std::vector<double>(msize, 0.0));
+    guess_Minv.assign(ninit, std::vector<double>(ncv*ncv, 0.0));
     for(unsigned i=0; i<ninit; ++i) {
-      for(unsigned k=0; k<msize; ++k) {
+      for(unsigned k=0; k<ncv*ncv; ++k) {
         if(!(in >> guess_Minv[i][k])) {
           error("ASM: GUESS_FILE '" + path + "' truncated reading Minv "
                 "for point " + std::to_string(i));
@@ -760,7 +747,7 @@ void ASM::readGuessFile(const std::string& path) {
 
 void ASM::interpolateLinear(const std::vector<std::vector<double>>& src,
                             std::vector<std::vector<double>>&       dst,
-                            const std::vector<double>&              metric_packed) const {
+                            const std::vector<double>&              metric) const {
   // Resample src (ninit points) onto dst (nnodes points) at equally-spaced
   // arc-lengths in the supplied metric. Endpoints preserved.
   const unsigned ninit  = src.size();
@@ -783,7 +770,7 @@ void ASM::interpolateLinear(const std::vector<std::vector<double>>& src,
   std::vector<double> dx(ncv);
   for(unsigned i=1; i<ninit; ++i) {
     for(unsigned k=0; k<ncv; ++k) dx[k] = A[i][k] - A[i-1][k];
-    L[i] = L[i-1] + lenM(dx, metric_packed);
+    L[i] = L[i-1] + lenM(dx, metric);
   }
   const double Ltot = L[ninit-1];
 
@@ -811,12 +798,12 @@ void ASM::buildArcLengths() {
   // string. L[0] = 0; L[i] = L[i-1] + ||nodes[i].cv-nodes[i-1].cv||_M
   // using the average of the two adjacent Minv-tensors.
   L.assign(nnodes, 0.0);
-  std::vector<double> dx(ncv), Mavg(msize);
+  std::vector<double> dx(ncv), Mavg(ncv*ncv);
   for(unsigned i=1; i<nnodes; ++i) {
     for(unsigned k=0; k<ncv; ++k) {
       dx[k] = getPntrToArgument(k)->difference(nodes[i-1].cv[k], nodes[i].cv[k]);
     }
-    for(unsigned k=0; k<msize; ++k) Mavg[k] = 0.5*(nodes[i-1].Minv[k] + nodes[i].Minv[k]);
+    for(unsigned k=0; k<ncv*ncv; ++k) Mavg[k] = 0.5*(nodes[i-1].Minv[k] + nodes[i].Minv[k]);
     L[i] = L[i-1] + lenM(dx, Mavg);
   }
   string_length = L[nnodes-1];
@@ -1068,7 +1055,7 @@ void ASM::writeCheckpoint(long local_step) {
   out.precision(15);
 
   out << "# ASM checkpoint \n";
-  out << "version 3\n";
+  out << "version 4\n";
   out << "local_step " << local_step << '\n';
   out << "nnodes "     << nnodes    << '\n';
   out << "ncv "        << ncv       << '\n';
@@ -1133,15 +1120,15 @@ void ASM::readCheckpoint() {
     for(auto& nd : nodes) {
       nd.cv  .assign(ncv,   0.0);
       nd.n   .assign(ncv,   0.0);
-      nd.Mav .assign(msize, 0.0);
-      nd.Minv.assign(msize, 0.0);
-      nd.B   .assign(msize, 0.0);
+      nd.Mav .assign(ncv*ncv, 0.0);
+      nd.Minv.assign(ncv*ncv, 0.0);
+      nd.B   .assign(ncv*ncv, 0.0);
     }
   }
   // Parse cluster-wide arrays into flat buffers; transfer into `nodes` at
   // the end so the handler table doesn't have to reach inside Node.
   std::vector<std::vector<double>> path_tmp(nnodes, std::vector<double>(ncv,   0.0));
-  std::vector<std::vector<double>> Mav_tmp (nnodes, std::vector<double>(msize, 0.0));
+  std::vector<std::vector<double>> Mav_tmp (nnodes, std::vector<double>(ncv*ncv, 0.0));
   std::vector<double>              pos_tmp (nnodes, 0.0);
   std::vector<double>              K_l_tmp (nnodes, 0.0);
   std::vector<std::vector<double>> dz_full(nnodes, std::vector<double>(ncv, 0.0));
@@ -1197,7 +1184,7 @@ void ASM::readCheckpoint() {
       std::string rest; std::getline(in, rest);   // unknown tag: skip line
     }
   }
-  if(version != 3) {
+  if(version != 4) {
     error("ASM checkpoint " + fname + " has unsupported version "
           + std::to_string(version));
   }
@@ -1437,16 +1424,14 @@ void ASM::updateBLocal() {
   // S_ij  = Minvn_i * Minvn_j      (outer product)
   // B = S*(K_l - K_d) + Minv*K_d
   std::vector<double> Minvn;
-  matVecPacked(nodes[node].Minv, nodes[node].n, Minvn);
+  matVec(nodes[node].Minv, nodes[node].n, Minvn);
 
   std::vector<double>& Bn = nodes[node].B;
-  Bn.assign(msize, 0.0);
-  unsigned p = 0;
+  Bn.assign(ncv*ncv, 0.0);
   const double dk = nodes[node].K_l - K_d;
   for(unsigned i=0; i<ncv; ++i) {
-    for(unsigned j=0; j<=i; ++j) {
-      Bn[p] = Minvn[i]*Minvn[j]*dk + nodes[node].Minv[p]*K_d;
-      ++p;
+    for(unsigned j=0; j<ncv; ++j) {
+      Bn[i*ncv + j] = Minvn[i]*Minvn[j]*dk + nodes[node].Minv[i*ncv + j]*K_d;
     }
   }
 }
@@ -1585,10 +1570,10 @@ void ASM::initOnFirstCall(bool from_restart) {
       const unsigned src_idx = (node * (guess_Minv.size()-1)) / (nnodes-1);
       nodes[node].Minv = guess_Minv[src_idx];
     }
-    invertPacked(nodes[node].Minv, nodes[node].Mav);
+    invertSym(nodes[node].Minv, nodes[node].Mav);
   } else {
     if(!read_M && !from_restart) buildLocalMetric(nodes[node].Mav);
-    invertPacked(nodes[node].Mav, nodes[node].Minv);
+    invertSym(nodes[node].Mav, nodes[node].Minv);
   }
 
   // 2. Initial string positions:
@@ -1671,7 +1656,7 @@ void ASM::calculate() {
   std::vector<double> dCV;
   cvDiff(node, dCV);
   std::vector<double> B_dCV;
-  matVecPacked(nodes[node].B, dCV, B_dCV);
+  matVec(nodes[node].B, dCV, B_dCV);
   double ene = 0.0, totf2 = 0.0;
   for(unsigned k=0; k<ncv; ++k) {
     const double f = -force_scale * B_dCV[k];
@@ -1685,9 +1670,9 @@ void ASM::calculate() {
   // 3. EMA-update Mav and refresh Minv.
   if(string_move && !read_M) {
     auto& Mav_node = nodes[node].Mav;
-    for(unsigned k=0; k<msize; ++k)
+    for(unsigned k=0; k<ncv*ncv; ++k)
       Mav_node[k] = (1.0 - Mav_damp)*Mav_node[k] + Mav_damp*M_now[k];
-    invertPacked(Mav_node, nodes[node].Minv);
+    invertSym(Mav_node, nodes[node].Minv);
     normaliseTangentLocal();
   }
 
@@ -1712,7 +1697,7 @@ void ASM::calculate() {
   //   tangent dot:   t = dCV · (Minv · n)  using current Minv
   //   dz_tmp_i = K_d * (dCV_i - n_i * t)
   std::vector<double> Minvn;
-  matVecPacked(nodes[node].Minv, nodes[node].n, Minvn);
+  matVec(nodes[node].Minv, nodes[node].n, Minvn);
   double tdot = 0.0;
   for(unsigned k=0; k<ncv; ++k) tdot += dCV[k] * Minvn[k];
   std::vector<double> dz_tmp(ncv, 0.0);
