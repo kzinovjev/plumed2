@@ -35,7 +35,6 @@
 #include "tools/Units.h"
 #include "CubicSplineLS.h"
 
-#include <array>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -58,6 +57,10 @@ private:
   // settle steps before dK starts being added to the K_l adaptation.
   static constexpr double EMA_DAMPING = 0.01;
   static constexpr long   EMA_SETTLE_STEPS = 99;
+  // Used only when the host has not supplied kBT yet (kJ/mol).
+  static constexpr double FALLBACK_KBT = 2.5;
+  // Rank-independent additive offset folded into the rex RNG seed.
+  static constexpr long   REX_RNG_SEED_OFFSET = 12345;
 
   // -------- topology (0-based) ------------------------------------------
   unsigned ncv     = 0;
@@ -126,7 +129,6 @@ private:
   std::string dir;
   std::string restart_filename;      // file to read on RESTART YES
   OFile dat_stream;                  // {node}.dat — per-step append
-  std::vector<long> snapshot_steps;  // history for convergence.dat
   // Lifecycle: ColdStart from construction, Restarted after readCheckpoint(),
   // Production once the first calculate() has run its init block.
   enum class Phase { ColdStart, Restarted, Production };
@@ -321,6 +323,10 @@ void ASM::registerKeywords(Keywords& keys) {
            "code's setMDTimeUnits)");
   keys.add("compulsory", "POSITION_GAMMA", "200000",
            "node-position friction, same unit convention as GAMMA");
+  // FORCE_GAMMA default is interpreted in inverse host time (ps^-1 under
+  // the default UNITS) and is then rescaled by the same factor as GAMMA
+  // below. Do not "simplify" the magnitude — the unit rescale is what
+  // makes the K_l adaptation rate consistent across unit systems.
   keys.add("compulsory", "FORCE_GAMMA",    "2000",
            "K-adaptation friction, same unit convention as GAMMA");
   keys.add("compulsory", "FORCE_KAPPA",    "1000",   "K-adaptation drift term");
@@ -501,8 +507,9 @@ ASM::ASM(const ActionOptions& ao):
   RT = getkBT();
   if(RT <= 0.0) {
     // Fall back to a sane default if the host has not provided kBT yet.
-    log.printf("  WARNING: kBT not yet set by host; using 2.5 (kJ/mol) as placeholder\n");
-    RT = 2.5;
+    log.printf("  WARNING: kBT not yet set by host; using %g (kJ/mol) as placeholder\n",
+               FALLBACK_KBT);
+    RT = FALLBACK_KBT;
   }
 
   // Initial-guess file.
@@ -541,15 +548,7 @@ ASM::ASM(const ActionOptions& ao):
   if(getRestart()) {
     readCheckpoint();
   }
-  if(!guess_file.empty()) {
-    log.printf("    initial guess: %s (reader not implemented yet — placeholder)\n",
-               guess_file.c_str());
-  }
 }
-
-// ---------------------------------------------------------------------------
-//   STUBS — to be filled in by subsequent commits
-// ---------------------------------------------------------------------------
 
 void ASM::cacheMasses() {
   if(masses_cached) return;
@@ -927,10 +926,10 @@ void ASM::writeParams() {
 
 void ASM::writeConvergence(long current_step) {
   // Iterate output_period boundaries up to current_step and read each
-  // snapshot fresh from disk. Walking snapshot_steps would miss entries
-  // when is_server migrates between ranks across REX swaps — the on-disk
-  // .string set is the source of truth. The file is rewritten on each
-  // call, so OFile's restart-aware append semantics do not fit.
+  // snapshot fresh from disk: the on-disk .string set is the source of
+  // truth because the server identity can migrate between ranks across
+  // REX swaps. The file is rewritten on each call, so OFile's
+  // restart-aware append semantics do not fit.
   const std::string fname = dir + "convergence.dat";
   std::ofstream out(fname);
   if(!out) error("ASM: cannot open " + fname);
@@ -1042,9 +1041,6 @@ void ASM::writeCheckpoint(long local_step) {
     for(double v : row) { out.width(24); out << v; }
     out << '\n';
   };
-  auto emit_scalar_row = [&](const std::vector<double>& row) {
-    emit_row(row);
-  };
 
   // Rank -> node mapping at checkpoint time.
   out << "rank_to_node\n";
@@ -1059,14 +1055,14 @@ void ASM::writeCheckpoint(long local_step) {
   for(unsigned i=0; i<nnodes; ++i) emit_row(nodes[i].Mav.getVector());
   std::vector<double> pos_flat(nnodes), K_l_flat(nnodes);
   for(unsigned i=0; i<nnodes; ++i) { pos_flat[i] = nodes[i].pos; K_l_flat[i] = nodes[i].K_l; }
-  out << "pos\n";        emit_scalar_row(pos_flat);
-  out << "K_l\n";        emit_scalar_row(K_l_flat);
+  out << "pos\n";        emit_row(pos_flat);
+  out << "K_l\n";        emit_row(K_l_flat);
   out << "dz\n";
   for(unsigned i=0; i<nnodes; ++i) emit_row(dz_full[i]);
-  out << "dpos\n";       emit_scalar_row(dpos_full);
-  out << "dK\n";         emit_scalar_row(dK_full);
-  out << "mean_dx\n";    emit_scalar_row(mdx_full);
-  out << "mean_sigma2\n";emit_scalar_row(ms2_full);
+  out << "dpos\n";       emit_row(dpos_full);
+  out << "dK\n";         emit_row(dK_full);
+  out << "mean_dx\n";    emit_row(mdx_full);
+  out << "mean_sigma2\n";emit_row(ms2_full);
   out.close();
 
   std::error_code ec;
@@ -1268,7 +1264,8 @@ void ASM::attemptReplicaExchange(long local_step) {
   if(!rex_rng_seeded) {
     // Seed deterministically off rank 0 only; we Bcast all decisions, so
     // ranks > 0 never need their RNG state.
-    rex_rng.setSeed(- (long)(plumed.multi_sim_comm.Get_rank()) - 12345 - long(getStep()));
+    rex_rng.setSeed(- (long)(plumed.multi_sim_comm.Get_rank())
+                    - REX_RNG_SEED_OFFSET - long(getStep()));
     rex_rng_seeded = true;
   }
 
@@ -1503,7 +1500,6 @@ void ASM::update() {
     if(is_server) {
       writeSnapshot(local_step);
       writeParams();
-      snapshot_steps.push_back(local_step);
       writeConvergence(local_step);
     }
   }
@@ -1595,7 +1591,6 @@ void ASM::initOnFirstCall(bool from_restart) {
   if(is_server) {
     writeSnapshot(lstep0);
     writeParams();
-    snapshot_steps.push_back(lstep0);
     // No writeConvergence() at cold-start: the current string equals the
     // snapshot just written, so every distance would be 0.
   }
@@ -1710,12 +1705,12 @@ void ASM::calculate() {
 
 void ASM::apply() {
   // Replicates bias::Bias::apply (we cannot inherit Bias because it does not
-  // virtually-derive from ActionAtomistic).
+  // virtually-derive from ActionAtomistic). Stride is pinned to 1 by the
+  // constructor, so the per-call factor reduces to 1.
   const unsigned noa = getNumberOfArguments();
   if(onStep()) {
-    const double gstr = double(getStride());
     for(unsigned i=0; i<noa; ++i) {
-      getPntrToArgument(i)->addForce(gstr * outputForces[i]);
+      getPntrToArgument(i)->addForce(outputForces[i]);
     }
   }
 }
