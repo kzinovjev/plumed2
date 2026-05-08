@@ -230,6 +230,9 @@ private:
 
   // string-method helpers
   void initStringFromCurrentCV();
+  // Unwrap each periodic CV in `path` so consecutive points differ by no
+  // more than half a period. In-place. Non-periodic CVs are unchanged.
+  void unwrapPolyline(std::vector<std::vector<double>>& path) const;
   void buildArcLengths(std::vector<double>& L);  // sets L from |string[i+1]-string[i]|_Minv
   void computeTangentsFD();         // tangent at each node from finite differences
   void normaliseTangentLocal();     // nodes[node].n /= ||nodes[node].n||_Minv
@@ -753,14 +756,7 @@ void ASM::interpolateLinear(const std::vector<std::vector<double>>& src,
 
   // Continuous (un-PBC-wrapped) copy of src for the arc-length sum.
   std::vector<std::vector<double>> A = src;
-  for(unsigned k=0; k<ncv; ++k) {
-    Value* v = getPntrToArgument(k);
-    if(!v->isPeriodic()) continue;
-    for(unsigned i=1; i<ninit; ++i) {
-      const double d = v->difference(A[i-1][k], A[i][k]);
-      A[i][k] = A[i-1][k] + d;
-    }
-  }
+  unwrapPolyline(A);
 
   // Arc lengths in the supplied metric.
   std::vector<double> L(ninit, 0.0);
@@ -807,6 +803,18 @@ void ASM::buildArcLengths(std::vector<double>& L) {
     L[i] = L[i-1] + lenM(dx, Mavg);
   }
   string_length = L[nnodes-1];
+}
+
+void ASM::unwrapPolyline(std::vector<std::vector<double>>& path) const {
+  const unsigned npts = path.size();
+  for(unsigned k=0; k<ncv; ++k) {
+    Value* v = getPntrToArgument(k);
+    if(!v->isPeriodic()) continue;
+    for(unsigned i=1; i<npts; ++i) {
+      const double d = v->difference(path[i-1][k], path[i][k]);
+      path[i][k] = path[i-1][k] + d;
+    }
+  }
 }
 
 void ASM::toContinuousString() {
