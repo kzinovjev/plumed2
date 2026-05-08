@@ -45,6 +45,7 @@
 
 #include "function/Function.h"
 #include "core/ActionRegister.h"
+#include "tools/Matrix.h"
 #include <fstream>
 #include <vector>
 #include <cmath>
@@ -57,9 +58,9 @@ class FuncPathASM : public Function {
   unsigned ncv;
   unsigned npoints;
   double   lambda;
-  std::vector<double>                            arc;     // [npoints]
-  std::vector<std::vector<double>>               path;    // [npoints][ncv]
-  std::vector<std::vector<std::vector<double>>>  Minv;    // [npoints][ncv][ncv]
+  std::vector<double>              arc;    // [npoints]
+  std::vector<std::vector<double>> path;   // [npoints][ncv]
+  std::vector<Matrix<double>>      Minv;   // [npoints], each ncv*ncv
 
 public:
   explicit FuncPathASM(const ActionOptions&);
@@ -113,12 +114,11 @@ FuncPathASM::FuncPathASM(const ActionOptions& ao):
     }
   }
 
-  Minv.assign(npoints,
-               std::vector<std::vector<double>>(ncv, std::vector<double>(ncv)));
+  Minv.assign(npoints, Matrix<double>(ncv, ncv));
   for(unsigned i=0; i<npoints; ++i) {
     for(unsigned j=0; j<ncv; ++j) {
       for(unsigned k=0; k<ncv; ++k) {
-        if(!(f >> Minv[i][j][k])) error("failed to read Minv tensor");
+        if(!(f >> Minv[i](j,k))) error("failed to read Minv tensor");
       }
     }
   }
@@ -142,14 +142,8 @@ void FuncPathASM::calculate() {
     for(unsigned j=0; j<ncv; ++j) {
       dx[j] = getPntrToArgument(j)->difference(path[i][j], getArgument(j));
     }
-    auto& Mx = Mdx[i];
-    for(unsigned j=0; j<ncv; ++j) {
-      double s = 0.0;
-      for(unsigned k=0; k<ncv; ++k) s += Minv[i][j][k] * dx[k];
-      Mx[j] = s;
-    }
-    double d2 = 0.0;
-    for(unsigned j=0; j<ncv; ++j) d2 += dx[j] * Mx[j];
+    mult(Minv[i], dx, Mdx[i]);
+    double d2 = dotProduct(dx, Mdx[i]);
     if(d2 < 0.0) d2 = 0.0;        // tolerate tiny negatives from non-PSD Minv
     dist[i] = std::sqrt(d2);
   }

@@ -33,6 +33,7 @@
 #include "tools/Matrix.h"
 #include "tools/Random.h"
 #include "tools/Units.h"
+#include "ASMUtils.h"
 #include "CubicSplineLS.h"
 
 #include <cmath>
@@ -191,15 +192,12 @@ private:
   void cacheMasses();
   void buildLocalMetric(Matrix<double>& Mout);
 
-  // metric-weighted dot:  a^T M b
-  double dotProductM(const std::vector<double>& a,
-                     const std::vector<double>& b,
-                     const Matrix<double>&      M) const;
-  // metric-weighted norm:  sqrt(v^T M v)
-  double lenM(const std::vector<double>& v,
-              const Matrix<double>&      M) const;
   // periodic-aware difference  (string_node_i - cv_i)
   void cvDiff(unsigned i, std::vector<double>& dCV) const;
+  // Snapshot of getPntrToArgument(0..ncv-1) as a flat vector — needed by
+  // the free helpers in ASMUtils.h (unwrapPolyline) which take a
+  // vector<Value*> rather than rely on action membership.
+  std::vector<Value*> argList() const;
 
   // multi-replica state synchronisation
   // Plain Allgather over multi_sim_comm + Bcast within comm, with the
@@ -230,9 +228,6 @@ private:
 
   // string-method helpers
   void initStringFromCurrentCV();
-  // Unwrap each periodic CV in `path` so consecutive points differ by no
-  // more than half a period. In-place. Non-periodic CVs are unchanged.
-  void unwrapPolyline(std::vector<std::vector<double>>& path) const;
   void buildArcLengths(std::vector<double>& L);  // sets L from |string[i+1]-string[i]|_Minv
   void computeTangentsFD();         // tangent at each node from finite differences
   void normaliseTangentLocal();     // nodes[node].n /= ||nodes[node].n||_Minv
@@ -603,25 +598,18 @@ void ASM::buildLocalMetric(Matrix<double>& Mout) {
   }
 }
 
-double ASM::dotProductM(const std::vector<double>& a,
-                        const std::vector<double>& b,
-                        const Matrix<double>&      M) const {
-  std::vector<double> Mb;
-  mult(M, b, Mb);
-  return dotProduct(a, Mb);
-}
-double ASM::lenM(const std::vector<double>& v,
-                 const Matrix<double>&      M) const {
-  const double s = dotProductM(v, v, M);
-  return s > 0.0 ? std::sqrt(s) : 0.0;
-}
-
 void ASM::cvDiff(unsigned i, std::vector<double>& dCV) const {
   // Periodic-aware (CV - string[node]) via Value::difference.
   dCV.resize(ncv);
   for(unsigned k=0; k<ncv; ++k) {
     dCV[k] = getPntrToArgument(k)->difference(nodes[i].cv[k], getArgument(k));
   }
+}
+
+std::vector<Value*> ASM::argList() const {
+  std::vector<Value*> args(ncv);
+  for(unsigned k=0; k<ncv; ++k) args[k] = getPntrToArgument(k);
+  return args;
 }
 
 namespace {
@@ -686,11 +674,7 @@ void ASM::gatherStringAcrossReplicas() {
     pi.pop(nodes[n].pos);
     pi.pop(nodes[n].K_l);
   }
-  for(unsigned i=0; i<nnodes; ++i) {
-    if(Invert(nodes[i].Mav, nodes[i].Minv) != 0) {
-      plumed_merror("ASM: failed to invert metric tensor");
-    }
-  }
+  for(unsigned i=0; i<nnodes; ++i) invertOrFail(nodes[i].Mav, nodes[i].Minv);
 }
 
 void ASM::gatherBAcrossReplicas() {
@@ -720,9 +704,7 @@ void ASM::gatherMavMeanInverted(Matrix<double>& Mtmpinv) {
   }
   Mtmp *= (1.0 / double(nnodes));
   Mtmpinv.resize(ncv, ncv);
-  if(Invert(Mtmp, Mtmpinv) != 0) {
-    plumed_merror("ASM: failed to invert metric tensor");
-  }
+  invertOrFail(Mtmp, Mtmpinv);
 }
 
 void ASM::readGuessFile(const std::string& path) {
@@ -774,7 +756,7 @@ void ASM::interpolateLinear(const std::vector<std::vector<double>>& src,
 
   // Continuous (un-PBC-wrapped) copy of src for the arc-length sum.
   std::vector<std::vector<double>> A = src;
-  unwrapPolyline(A);
+  unwrapPolyline(argList(), A);
 
   // Arc lengths in the supplied metric.
   std::vector<double> L(ninit, 0.0);
@@ -821,18 +803,6 @@ void ASM::buildArcLengths(std::vector<double>& L) {
     L[i] = L[i-1] + lenM(dx, Mavg);
   }
   string_length = L[nnodes-1];
-}
-
-void ASM::unwrapPolyline(std::vector<std::vector<double>>& path) const {
-  const unsigned npts = path.size();
-  for(unsigned k=0; k<ncv; ++k) {
-    Value* v = getPntrToArgument(k);
-    if(!v->isPeriodic()) continue;
-    for(unsigned i=1; i<npts; ++i) {
-      const double d = v->difference(path[i-1][k], path[i][k]);
-      path[i][k] = path[i-1][k] + d;
-    }
-  }
 }
 
 void ASM::toContinuousString() {
@@ -1559,14 +1529,10 @@ void ASM::initOnFirstCall(bool from_restart) {
       const unsigned src_idx = (node * (guess_Minv.size()-1)) / (nnodes-1);
       nodes[node].Minv = guess_Minv[src_idx];
     }
-    if(Invert(nodes[node].Minv, nodes[node].Mav) != 0) {
-      plumed_merror("ASM: failed to invert metric tensor");
-    }
+    invertOrFail(nodes[node].Minv, nodes[node].Mav);
   } else {
     if(!read_M && !from_restart) buildLocalMetric(nodes[node].Mav);
-    if(Invert(nodes[node].Mav, nodes[node].Minv) != 0) {
-      plumed_merror("ASM: failed to invert metric tensor");
-    }
+    invertOrFail(nodes[node].Mav, nodes[node].Minv);
   }
 
   // 2. Initial string positions:
@@ -1666,9 +1632,7 @@ void ASM::calculate() {
     for(unsigned i=0; i<ncv; ++i)
       for(unsigned j=0; j<ncv; ++j)
         Mav_node(i,j) = a*Mav_node(i,j) + b*M_now(i,j);
-    if(Invert(Mav_node, nodes[node].Minv) != 0) {
-      plumed_merror("ASM: failed to invert metric tensor");
-    }
+    invertOrFail(Mav_node, nodes[node].Minv);
     normaliseTangentLocal();
   }
 
