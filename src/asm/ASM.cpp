@@ -687,18 +687,15 @@ void ASM::gatherBAcrossReplicas() {
 
 void ASM::gatherMavMeanInverted(Matrix<double>& Mtmpinv) {
   // Sum each replica's nodes[node].Mav across multi_sim_comm, divide by nnodes,
-  // then invert. Run on rank-0-of-comm and Bcast within comm so every rank
-  // of a replica sees the same metric.
-  std::vector<double> send = nodes[node].Mav.getVector();
-  std::vector<double> recv(ncv*ncv*nnodes, 0.0);
-  if(comm.Get_rank() == 0) {
-    plumed.multi_sim_comm.Allgather(send, recv);
-  }
-  comm.Bcast(recv, 0);
+  // then invert. The summation is over all node slots so the rank-vs-node
+  // remap is irrelevant, but routing through nodeAwareAllgather keeps the
+  // intra-replica Bcast and rank-0 plumbing in one place.
+  std::vector<std::vector<double>> by_node;
+  nodeAwareAllgather(nodes[node].Mav.getVector(), by_node);
   Matrix<double> Mtmp(ncv, ncv);
   auto& Mv = Mtmp.getVector();
   for(unsigned i=0; i<nnodes; ++i) {
-    for(unsigned k=0; k<ncv*ncv; ++k) Mv[k] += recv[i*ncv*ncv + k];
+    for(unsigned k=0; k<ncv*ncv; ++k) Mv[k] += by_node[i][k];
   }
   Mtmp *= (1.0 / double(nnodes));
   Mtmpinv.resize(ncv, ncv);
