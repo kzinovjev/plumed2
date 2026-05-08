@@ -89,11 +89,7 @@ private:
   unsigned checkpoint_period   = 0;
   unsigned REX_period          = 0;
   long     start_step          = 0;
-  // local_step = getStep() + step0 - preparation_steps + 1.
-  // The +1 makes local_step 1-based at the first production step.
-  // Cold start: step0 = 0. Restart: step0 chosen so the first
-  // post-restart calculate reproduces the saved local_step.
-  long     step0               = 0;
+  long     step0               = 0;   // see getLocalStep()
 
   // 1/m_a per atom, indexed by AtomNumber::index(); fed to
   // Value::projectionWithAtomWeights to assemble the metric tensor.
@@ -172,6 +168,13 @@ public:
 private:
   void setOutputForce(unsigned i, double f) { outputForces[i] = f; }
   void setBias(double e) { val_bias->set(e); }
+
+  // 1-based at the first production step; negative during preparation.
+  // step0 = 0 cold-start; on restart it is set so the first post-restart
+  // calculate() reproduces the saved local_step.
+  long getLocalStep() const {
+    return long(getStep()) + step0 - long(preparation_steps) + 1;
+  }
 
   // metric helpers
   // Metric tensors (Mav, Minv, B, the Matrix arguments below) are full
@@ -1455,7 +1458,7 @@ void ASM::reparametrizeLinear() {
 
 void ASM::update() {
   if(phase != Phase::Production) return;   // first update() arrives before calculate's init
-  const long local_step = getStep() + step0 - long(preparation_steps) + 1;
+  const long local_step = getLocalStep();
 
   // local_step > 0 excludes a phantom local_step=0 production tick that
   // would otherwise fire string motion / REX / accumulators before any
@@ -1586,8 +1589,7 @@ void ASM::initOnFirstCall(bool from_restart) {
   // On restart we use the resumed local_step so the file lines up with
   // the existing on-disk filenames.
   if(!outputs_opened) { openOutputFiles(); outputs_opened = true; }
-  const long lstep0 =
-    from_restart ? (getStep() + step0 - long(preparation_steps) + 1) : 0L;
+  const long lstep0 = from_restart ? getLocalStep() : 0L;
   if(is_server) {
     writeSnapshot(lstep0);
     writeParams();
@@ -1606,7 +1608,7 @@ void ASM::calculate() {
     phase = Phase::Production;
   }
 
-  const long local_step = getStep() + step0 - long(preparation_steps) + 1;
+  const long local_step = getLocalStep();
 
   // 1. Local metric sample (this step).
   Matrix<double> M_now;
