@@ -176,6 +176,12 @@ private:
     return long(getStep()) + step0 - long(preparation_steps) + 1;
   }
 
+  void setNodeIdentity(unsigned new_node) {
+    node = new_node;
+    is_terminal = (node == 0 || node + 1 == nnodes);
+    is_server   = (node == 0);
+  }
+
   // metric helpers
   // Metric tensors (Mav, Minv, B, the Matrix arguments below) are full
   // symmetric ncv×ncv stored in PLUMED's Matrix<double>. Operations needing
@@ -382,14 +388,13 @@ ASM::ASM(const ActionOptions& ao):
   nnodes = comm.Get_rank() == 0
               ? plumed.multi_sim_comm.Get_size() : 0;
   comm.Bcast(nnodes, 0);
-  node = comm.Get_rank() == 0
+  unsigned my_node = comm.Get_rank() == 0
               ? plumed.multi_sim_comm.Get_rank() : 0;
-  comm.Bcast(node, 0);
-  is_terminal = (node == 0 || node + 1 == nnodes);
-  is_server   = (node == 0);
+  comm.Bcast(my_node, 0);
   if(nnodes < 2) {
     error("ASM requires at least 2 replicas (string nodes); got " + std::to_string(nnodes));
   }
+  setNodeIdentity(my_node);
 
   // ---- input CVs -------------------------------------------------------
   ncv = getNumberOfArguments();
@@ -1191,9 +1196,7 @@ void ASM::readCheckpoint() {
   // Restore this rank's node identity from the checkpoint, then pick
   // accumulator slots by node
   const unsigned my_msc_rank = node;
-  node        = rank_to_node_ck[my_msc_rank];
-  is_terminal = (node == 0 || node + 1 == nnodes);
-  is_server   = (node == 0);
+  setNodeIdentity(rank_to_node_ck[my_msc_rank]);
   for(unsigned r=0; r<nnodes; ++r) node_to_rank[rank_to_node_ck[r]] = r;
 
   // Pick this rank's accumulator slot.
@@ -1335,8 +1338,7 @@ void ASM::attemptReplicaExchange(long local_step) {
   // collective (Allgather) call — partial participation would hang MPI. Skip
   // entirely if no swap happened anywhere.
   if(any_swap) {
-    is_terminal = (node == 0 || node+1 == nnodes);
-    is_server   = (node == 0);
+    setNodeIdentity(node);
     reparametrizeLinear();
   }
 
