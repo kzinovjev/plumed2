@@ -624,6 +624,28 @@ void ASM::cvDiff(unsigned i, std::vector<double>& dCV) const {
   }
 }
 
+namespace {
+// Lightweight pack/unpack into a flat double buffer. PackerOut appends;
+// PackerIn pops in the same order. Eliminates manual cursor bookkeeping at
+// the gather call-sites.
+struct PackerOut {
+  std::vector<double>& buf;
+  explicit PackerOut(std::vector<double>& b) : buf(b) {}
+  void push(double x)                     { buf.push_back(x); }
+  void push(const std::vector<double>& v) { buf.insert(buf.end(), v.begin(), v.end()); }
+};
+struct PackerIn {
+  const std::vector<double>& buf;
+  std::size_t cursor = 0;
+  explicit PackerIn(const std::vector<double>& b) : buf(b) {}
+  void pop(double& x) { x = buf[cursor++]; }
+  void pop(std::vector<double>& v) {
+    std::copy(buf.begin()+cursor, buf.begin()+cursor+v.size(), v.begin());
+    cursor += v.size();
+  }
+};
+}  // namespace
+
 void ASM::nodeAwareAllgather(const std::vector<double>&        send,
                              std::vector<std::vector<double>>& recv_by_node) const {
   const unsigned pn = send.size();
@@ -648,22 +670,21 @@ void ASM::gatherStringAcrossReplicas() {
   // is atomic against any state read between two reparam-style gathers.
   std::vector<double> send;
   send.reserve(ncv + ncv*ncv + 2u);
-  for(unsigned k=0; k<ncv; ++k) send.push_back(nodes[node].cv[k]);
-  for(double v : nodes[node].Mav.getVector()) send.push_back(v);
-  send.push_back(nodes[node].pos);
-  send.push_back(nodes[node].K_l);
+  PackerOut po(send);
+  po.push(nodes[node].cv);
+  po.push(nodes[node].Mav.getVector());
+  po.push(nodes[node].pos);
+  po.push(nodes[node].K_l);
 
   std::vector<std::vector<double>> by_node;
   nodeAwareAllgather(send, by_node);
 
   for(unsigned n=0; n<nnodes; ++n) {
-    const auto& p = by_node[n];
-    unsigned q = 0;
-    for(unsigned k=0; k<ncv; ++k) nodes[n].cv[k] = p[q++];
-    auto& Mv = nodes[n].Mav.getVector();
-    for(unsigned k=0; k<ncv*ncv; ++k) Mv[k] = p[q++];
-    nodes[n].pos = p[q++];
-    nodes[n].K_l = p[q++];
+    PackerIn pi(by_node[n]);
+    pi.pop(nodes[n].cv);
+    pi.pop(nodes[n].Mav.getVector());
+    pi.pop(nodes[n].pos);
+    pi.pop(nodes[n].K_l);
   }
   for(unsigned i=0; i<nnodes; ++i) {
     if(Invert(nodes[i].Mav, nodes[i].Minv) != 0) {
@@ -994,11 +1015,12 @@ void ASM::gatherAccumulatorsByNode(
     std::vector<double>& ms2_full) const {
   std::vector<double> send;
   send.reserve(ncv + 4u);
-  for(unsigned k=0; k<ncv; ++k) send.push_back(dz[k]);
-  send.push_back(dpos);
-  send.push_back(dK);
-  send.push_back(mean_dx);
-  send.push_back(mean_sigma2);
+  PackerOut po(send);
+  po.push(dz);
+  po.push(dpos);
+  po.push(dK);
+  po.push(mean_dx);
+  po.push(mean_sigma2);
 
   std::vector<std::vector<double>> by_node;
   nodeAwareAllgather(send, by_node);
@@ -1009,13 +1031,12 @@ void ASM::gatherAccumulatorsByNode(
   mdx_full .assign(nnodes, 0.0);
   ms2_full .assign(nnodes, 0.0);
   for(unsigned n=0; n<nnodes; ++n) {
-    const auto& p = by_node[n];
-    unsigned q = 0;
-    for(unsigned k=0; k<ncv; ++k) dz_full[n][k] = p[q++];
-    dpos_full[n] = p[q++];
-    dK_full  [n] = p[q++];
-    mdx_full [n] = p[q++];
-    ms2_full [n] = p[q++];
+    PackerIn pi(by_node[n]);
+    pi.pop(dz_full[n]);
+    pi.pop(dpos_full[n]);
+    pi.pop(dK_full[n]);
+    pi.pop(mdx_full[n]);
+    pi.pop(ms2_full[n]);
   }
 }
 
@@ -1283,12 +1304,15 @@ void ASM::attemptReplicaExchange(long local_step) {
   // ---- Allgather per-rank packet (cv + dz + scalar accumulators) ------
   std::vector<double> send;
   send.reserve(2u*ncv + 4u);
-  for(unsigned k=0; k<ncv; ++k) send.push_back(getArgument(k));
-  for(unsigned k=0; k<ncv; ++k) send.push_back(dz[k]);
-  send.push_back(dpos);
-  send.push_back(dK);
-  send.push_back(mean_dx);
-  send.push_back(mean_sigma2);
+  std::vector<double> cv_local(ncv);
+  for(unsigned k=0; k<ncv; ++k) cv_local[k] = getArgument(k);
+  PackerOut po(send);
+  po.push(cv_local);
+  po.push(dz);
+  po.push(dpos);
+  po.push(dK);
+  po.push(mean_dx);
+  po.push(mean_sigma2);
 
   std::vector<std::vector<double>> by_node;
   nodeAwareAllgather(send, by_node);
@@ -1298,14 +1322,13 @@ void ASM::attemptReplicaExchange(long local_step) {
   std::vector<double> dpos_by_node(nnodes), dK_by_node(nnodes);
   std::vector<double> mdx_by_node(nnodes),  ms2_by_node(nnodes);
   for(unsigned n=0; n<nnodes; ++n) {
-    const auto& p = by_node[n];
-    unsigned q = 0;
-    for(unsigned k=0; k<ncv; ++k) cv_by_node[n][k] = p[q++];
-    for(unsigned k=0; k<ncv; ++k) dz_by_node[n][k] = p[q++];
-    dpos_by_node[n] = p[q++];
-    dK_by_node[n]   = p[q++];
-    mdx_by_node[n]  = p[q++];
-    ms2_by_node[n]  = p[q++];
+    PackerIn pi(by_node[n]);
+    pi.pop(cv_by_node[n]);
+    pi.pop(dz_by_node[n]);
+    pi.pop(dpos_by_node[n]);
+    pi.pop(dK_by_node[n]);
+    pi.pop(mdx_by_node[n]);
+    pi.pop(ms2_by_node[n]);
   }
 
   // ---- Decide acceptance for alternating adjacent pairs ----------------
