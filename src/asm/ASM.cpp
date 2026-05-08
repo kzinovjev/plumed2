@@ -132,7 +132,6 @@ private:
   enum class Phase { ColdStart, Restarted, Production };
   Phase phase = Phase::ColdStart;
   bool  outputs_opened  = false;
-  std::vector<double> dz_tmp_last;   // last per-step dz (for write_dat)
 
   // -------- output components -------------------------------------------
   Value* val_bias   = nullptr;
@@ -231,21 +230,24 @@ private:
 
   // string-method helpers
   void initStringFromCurrentCV();
-  void buildArcLengths();           // sets L from |string[i+1]-string[i]|_Minv
+  void buildArcLengths(std::vector<double>& L);  // sets L from |string[i+1]-string[i]|_Minv
   void computeTangentsFD();         // tangent at each node from finite differences
   void normaliseTangentLocal();     // nodes[node].n /= ||nodes[node].n||_Minv
   void updateBLocal();              // nodes[node].B from K_l, K_d, n, Minv
-  void reparametrizeLinear();       // gather + arclength + tangent + updateB
+  // is_first_call: true on the very first call (cold-start init); false
+  // for restart-time and all subsequent calls. Gates the K_l rescale and
+  // the equal-spacing pos seeding.
+  void reparametrizeLinear(bool is_first_call);
   void toContinuousString();        // unwrap periodic CVs along the string
   void toBoxLocalNode();            // wrap nodes[node].cv back into PBC range
-  void fitStringSpline();           // smoothing cubic spline over arc-length
+  void fitStringSpline(const std::vector<double>& L);  // smoothing cubic spline over arc-length
   void splineTangentLocal();        // nodes[node].n from spline derivative at nodes[node].pos
   double scaleDpos(double x) const; // damping near the neighbour gap
 
   // output writers
   void mkOutputDir() const;
   void openOutputFiles();
-  void writeDat();                  // {node}.dat — per-step append
+  void writeDat(const std::vector<double>& dz_tmp);  // {node}.dat — per-step append
   void writeSnapshot(long step);    // {step}.string — every output_period
   void writeParams();               // node_positions.dat, force_constants.dat
   void writeConvergence(long current_step);  // convergence.dat — distances of all snapshots up to current_step
@@ -280,9 +282,6 @@ private:
                      const std::vector<double>& ms2_by_node,
                      bool& any_swap);
 
-  // first-call guard for one-time work in reparametrizeLinear
-  bool first_reparametrize = true;
-  std::vector<double> L;            // arc lengths to each node (rebuilt every reparam)
 };
 
 PLUMED_REGISTER_ACTION(ASM, "ASM")
@@ -788,7 +787,7 @@ void ASM::initStringFromCurrentCV() {
   for(unsigned k=0; k<ncv; ++k) nodes[node].cv[k] = getArgument(k);
 }
 
-void ASM::buildArcLengths() {
+void ASM::buildArcLengths(std::vector<double>& L) {
   // Cumulative metric-weighted arc length along the (continuous-on-PBC)
   // string. L[0] = 0; L[i] = L[i-1] + ||nodes[i].cv-nodes[i-1].cv||_M
   // using the average of the two adjacent Minv-tensors.
@@ -829,7 +828,7 @@ void ASM::toBoxLocalNode() {
   }
 }
 
-void ASM::fitStringSpline() {
+void ASM::fitStringSpline(const std::vector<double>& L) {
   // Smoothing cubic-spline fit over arc length, with nseg = max(1, nnodes/2-1).
   // For small nnodes (<4) the LS fit degenerates; in that regime the FD
   // tangent is fine and we leave string_spline empty as a signal to fall back.
@@ -878,13 +877,13 @@ void ASM::openOutputFiles() {
   if(!dat_stream) error("ASM: failed to open " + fname + " for output");
 }
 
-void ASM::writeDat() {
+void ASM::writeDat(const std::vector<double>& dz_tmp) {
   // Per-step trajectory: CVs, this node's string position, dz_tmp/gamma.
   if(!dat_stream.isOpen()) return;
   for(unsigned k=0; k<ncv; ++k) dat_stream.printf("%15.5e", getArgument(k));
   for(unsigned k=0; k<ncv; ++k) dat_stream.printf("%15.5e", nodes[node].cv[k]);
   for(unsigned k=0; k<ncv; ++k)
-    dat_stream.printf("%15.5e", gamma > 0.0 ? dz_tmp_last[k] / gamma : 0.0);
+    dat_stream.printf("%15.5e", gamma > 0.0 ? dz_tmp[k] / gamma : 0.0);
   dat_stream.printf("\n");
   dat_stream.flush();
 }
@@ -1214,7 +1213,6 @@ void ASM::readCheckpoint() {
   // Pick step0 so the first post-restart calculate (getStep()=0)
   // reproduces saved_local_step under the local_step formula.
   step0 = saved_local_step + long(preparation_steps) - 1;
-  first_reparametrize = false;     // skip the equal-spacing pos initialiser
   phase = Phase::Restarted;        // skip cold-start metric/string init in calculate()
   log.printf("  ASM RESTART: resumed at local_step=%ld from %s\n",
              saved_local_step, fname.c_str());
@@ -1343,7 +1341,7 @@ void ASM::attemptReplicaExchange(long local_step) {
   // entirely if no swap happened anywhere.
   if(any_swap) {
     setNodeIdentity(node);
-    reparametrizeLinear();
+    reparametrizeLinear(/*is_first_call=*/false);
   }
 
   // Re-route per-step .dat output to the current node's file when this rank
@@ -1405,7 +1403,7 @@ void ASM::updateBLocal() {
   }
 }
 
-void ASM::reparametrizeLinear() {
+void ASM::reparametrizeLinear(bool is_first_call) {
   // Order: gather, unwrap periodic CVs, scale K_l by old length^2,
   // recompute arc lengths and string_length, divide K_l back by new
   // length^2, redistribute non-terminal nodes onto the new equal-step
@@ -1415,18 +1413,19 @@ void ASM::reparametrizeLinear() {
   toContinuousString();
 
   const double old_length = string_length;
-  if(rescale_forces && !first_reparametrize && old_length > 0.0) {
+  if(rescale_forces && !is_first_call && old_length > 0.0) {
     for(auto& nd : nodes) nd.K_l *= old_length*old_length;
   }
-  buildArcLengths();
-  if(rescale_forces && !first_reparametrize && string_length > 0.0) {
+  std::vector<double> L;
+  buildArcLengths(L);
+  if(rescale_forces && !is_first_call && string_length > 0.0) {
     for(auto& nd : nodes) nd.K_l /= string_length*string_length;
   }
 
   // First reparametrize: pos = L (the M-weighted arc lengths just built),
   // making the linear-interpolation step below a no-op (j=node, frac=1).
   // Otherwise rescale proportionally to the new total length.
-  if(first_reparametrize) {
+  if(is_first_call) {
     for(unsigned i=0; i<nnodes; ++i) nodes[i].pos = L[i];
   } else if(string_move && nodes[nnodes-1].pos > 0.0) {
     const double scale = string_length / nodes[nnodes-1].pos;
@@ -1451,15 +1450,13 @@ void ASM::reparametrizeLinear() {
   gatherStringAcrossReplicas();
 
   // Smoothing spline + tangent extraction.
-  fitStringSpline();
+  fitStringSpline(L);
   computeTangentsFD();          // baseline
   splineTangentLocal();         // override with spline derivative if available
   normaliseTangentLocal();
   updateBLocal();
   gatherBAcrossReplicas();
   toBoxLocalNode();
-
-  first_reparametrize = false;
 }
 
 void ASM::update() {
@@ -1493,7 +1490,7 @@ void ASM::update() {
     dpos = 0.0;
     dK   = 0.0;
 
-    reparametrizeLinear();
+    reparametrizeLinear(/*is_first_call=*/false);
   }
 
   // --- internal replica exchange ---
@@ -1573,7 +1570,7 @@ void ASM::initOnFirstCall(bool from_restart) {
   }
 
   // 3. Sync, build arclengths + tangents + B.
-  reparametrizeLinear();
+  reparametrizeLinear(/*is_first_call=*/!from_restart);
 
   // 4. Default K_l auto-tuning if user did not supply force_constant_l.
   //    On restart we keep the values restored from the checkpoint.
@@ -1657,14 +1654,13 @@ void ASM::calculate() {
   if(local_step < 0) {
     const long md_step = local_step + long(preparation_steps);
     force_scale = std::min(1.0, double(md_step) / double(preparation_steps));
-    dz_tmp_last.assign(ncv, 0.0);
     return;     // no .dat write, no accumulation during preparation
   }
   force_scale = 1.0;
   if(local_step < start_step) {
     // Production but not yet evolving — full force, .dat row, no accumulation.
-    dz_tmp_last.assign(ncv, 0.0);
-    writeDat();
+    const std::vector<double> dz_zero(ncv, 0.0);
+    writeDat(dz_zero);
     return;
   }
 
@@ -1708,8 +1704,7 @@ void ASM::calculate() {
     dpos += dpos_tmp;
     dK   += dK_tmp;
   }
-  dz_tmp_last = dz_tmp;
-  writeDat();
+  writeDat(dz_tmp);
 }
 
 void ASM::apply() {
