@@ -246,6 +246,9 @@ private:
 
   // output writers
   void mkOutputDir() const;
+  // Open an OFile in append-mode, with the node-suffix machinery disabled
+  // because node identity is already encoded in the file path.
+  void openAppendFile(OFile& f, const std::string& path);
   void openOutputFiles();
   void writeDat(const std::vector<double>& dz_tmp);  // {node}.dat — per-step append
   void writeSnapshot(long step);    // {step}.string — every output_period
@@ -863,18 +866,21 @@ void ASM::mkOutputDir() const {
   // Silently ignore failure: the open() calls below will surface the real error.
 }
 
+void ASM::openAppendFile(OFile& f, const std::string& path) {
+  f.link(*this);
+  f.enforceSuffix("");                // node identity is already in the path
+  f.enforceRestart();                 // force append-mode regardless of RESTART
+  f.open(path);
+  if(!f) error("ASM: failed to open " + path + " for output");
+}
+
 void ASM::openOutputFiles() {
   mkOutputDir();
   // 1-based on-disk filename (1.dat .. N.dat). Internal C++ indexing
   // remains 0-based; only the file name is offset.
-  const std::string fname = dir + std::to_string(node + 1) + ".dat";
   // Append unconditionally so a cold-start truncate-create or a RESTART YES
   // append both line up with how the file is laid out.
-  dat_stream.link(*this);
-  dat_stream.enforceSuffix("");        // node identity is already in the path
-  dat_stream.enforceRestart();         // force append-mode regardless of RESTART
-  dat_stream.open(fname);
-  if(!dat_stream) error("ASM: failed to open " + fname + " for output");
+  openAppendFile(dat_stream, dir + std::to_string(node + 1) + ".dat");
 }
 
 void ASM::writeDat(const std::vector<double>& dz_tmp) {
@@ -915,19 +921,9 @@ void ASM::writeSnapshot(long step) {
 
 void ASM::writeParams() {
   // node_positions.dat & force_constants.dat — appended every output_period.
-  const std::string n_fname = dir + "node_positions.dat";
-  const std::string k_fname = dir + "force_constants.dat";
   OFile nps, kps;
-  nps.link(*this);
-  nps.enforceSuffix("");
-  nps.enforceRestart();                // append every call
-  nps.open(n_fname);
-  if(!nps) error("ASM: cannot open " + n_fname);
-  kps.link(*this);
-  kps.enforceSuffix("");
-  kps.enforceRestart();
-  kps.open(k_fname);
-  if(!kps) error("ASM: cannot open " + k_fname);
+  openAppendFile(nps, dir + "node_positions.dat");
+  openAppendFile(kps, dir + "force_constants.dat");
   const double denom = (nodes[nnodes-1].pos != 0.0) ? nodes[nnodes-1].pos : 1.0;
   for(unsigned i=0; i<nnodes; ++i) nps.printf("%15.5f", nodes[i].pos / denom);
   nps.printf("\n");
