@@ -72,6 +72,8 @@ private:
   // -------- physics knobs ----------------------------------------------
   double K_l_local      = 0.0;
   double K_d            = 0.0;
+  bool   K_l_user_provided = false;
+  bool   K_d_user_provided = false;
   double gamma          = 0.0;
   double position_gamma = 0.0;
   double force_gamma    = 0.0;
@@ -480,6 +482,8 @@ ASM::ASM(const ActionOptions& ao):
   double K_l_in = -1.0, K_d_in = -1.0;
   parse("FORCE_CONSTANT_L", K_l_in);
   parse("FORCE_CONSTANT_D", K_d_in);
+  K_l_user_provided = (K_l_in >= 0.0);
+  K_d_user_provided = (K_d_in >= 0.0);
 
   // ---- output components ----------------------------------------------
   addComponent("bias");   componentIsNotPeriodic("bias");
@@ -504,11 +508,11 @@ ASM::ASM(const ActionOptions& ao):
 
   // Provisional K assignments — final values (auto-defaults, restart values)
   // are settled in the first calculate() once string_length is known.
-  if(K_l_in > 0.0) {
+  if(K_l_user_provided) {
     K_l_local = K_l_in;
     for(auto& nd : nodes) nd.K_l = K_l_in;
   }
-  K_d = (K_d_in > 0.0) ? K_d_in : 0.0;
+  if(K_d_user_provided) K_d = K_d_in;
 
   // RT in PLUMED energy units (kJ/mol unless overridden). getkBT() also
   // honours a TEMP keyword if present.
@@ -1572,16 +1576,17 @@ void ASM::initOnFirstCall(bool from_restart) {
   reparametrizeLinear();
 
   // 4. Default K_l auto-tuning if user did not supply force_constant_l.
+  //    On restart we keep the values restored from the checkpoint.
   //    Must run before writeParams so force_constants.dat row 0 reflects
   //    the actual initial K_l, and before updateBLocal so B is consistent.
-  if(K_l_local <= 0.0) {
+  if(!K_l_user_provided && !from_restart) {
     // K_l = RT / (Δ/2)^2 where Δ is the inter-node spacing.
     const double delta = string_length / double(nnodes-1);
     const double half_delta = 0.5 * delta;
     K_l_local = RT / (half_delta * half_delta);
     for(auto& nd : nodes) nd.K_l = K_l_local;
   }
-  if(K_d <= 0.0) {
+  if(!K_d_user_provided && !from_restart) {
     K_d = 0.5 * K_l_local;
   }
   updateBLocal();
