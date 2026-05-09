@@ -60,8 +60,6 @@ private:
   static constexpr long   EMA_SETTLE_STEPS = 99;
   // Used only when the host has not supplied kBT yet (kJ/mol).
   static constexpr double FALLBACK_KBT = 2.5;
-  // Rank-independent additive offset folded into the rex RNG seed.
-  static constexpr long   REX_RNG_SEED_OFFSET = 12345;
 
   // -------- topology (0-based) ------------------------------------------
   unsigned ncv     = 0;
@@ -90,7 +88,6 @@ private:
   unsigned string_move_period  = 1;
   unsigned output_period       = 0;
   unsigned checkpoint_period   = 0;
-  unsigned REX_period          = 0;
   long     start_step          = 0;
   long     step0               = 0;   // see getLocalStep()
 
@@ -178,12 +175,6 @@ private:
     return long(getStep()) + step0 - long(preparation_steps) + 1;
   }
 
-  void setNodeIdentity(unsigned new_node) {
-    node = new_node;
-    is_terminal = (node == 0 || node + 1 == nnodes);
-    is_server   = (node == 0);
-  }
-
   // metric helpers
   // Metric tensors (Mav, Minv, B, the Matrix arguments below) are full
   // symmetric ncv×ncv stored in PLUMED's Matrix<double>. Operations needing
@@ -200,18 +191,12 @@ private:
   std::vector<Value*> argList() const;
 
   // multi-replica state synchronisation
-  // Plain Allgather over multi_sim_comm + Bcast within comm, with the
-  // recv buffer re-indexed from rank-keyed to node-keyed using the cached
-  // node_to_rank[]. Caller supplies a uniform-size flat payload and gets
-  // recv_by_node[node] back. Relies on node_to_rank[] being consistent on
-  // every rank at the moment of the call (true between REX swaps and after
-  // applyRexSwaps, which updates the array identically on every rank).
-  void nodeAwareAllgather(const std::vector<double>&        send,
-                          std::vector<std::vector<double>>& recv_by_node) const;
+  // Each replica owns one node (node == multi_sim_comm.Get_rank()), so a
+  // plain Allgather already lands data in node order. The intra-replica
+  // Bcast keeps every rank in the same replica in sync.
+  void allgatherByNode(const std::vector<double>& send,
+                       std::vector<double>& recv) const;
   void gatherStringAcrossReplicas();
-  // Each replica computes B only for its own node in updateBLocal; the
-  // REX bias-energy probe needs B[i] for every i
-  void gatherBAcrossReplicas();
   // Cross-replica average of Mav, inverted: used as a single consistent
   // metric for cold-start guess interpolation. Non-const to access
   // Matrix::getVector() on nodes[node].Mav (no const overload upstream);
@@ -256,9 +241,8 @@ private:
   // checkpoint / restart
   void writeCheckpoint(long local_step);
   void readCheckpoint();            // called from constructor when RESTART YES
-  // Node-aware Allgather of the rank-owned accumulators (dz, dpos, dK,
-  // mean_dx, mean_sigma2). Output arrays are indexed by node — required
-  // because rank != node after any REX swap.
+  // Allgather of the rank-owned accumulators (dz, dpos, dK, mean_dx,
+  // mean_sigma2). Output arrays are indexed by node, which equals rank.
   void gatherAccumulatorsByNode(
       std::vector<std::vector<double>>& dz_full,
       std::vector<double>& dpos_full,
@@ -268,21 +252,6 @@ private:
 
   // first-call init split out from calculate()
   void initOnFirstCall(bool from_restart);
-
-  // replica exchange
-  std::vector<unsigned> node_to_rank;   // global, consistent on all ranks
-  Random rex_rng;
-  bool   rex_rng_seeded = false;
-  void attemptReplicaExchange(long local_step);
-  double biasEnergyAt(unsigned node_idx, const std::vector<double>& cv_at_partner) const;
-  void applyRexSwaps(const std::vector<int>& accept,
-                     const std::vector<std::vector<double>>& dz_by_node,
-                     const std::vector<double>& dpos_by_node,
-                     const std::vector<double>& dK_by_node,
-                     const std::vector<double>& mdx_by_node,
-                     const std::vector<double>& ms2_by_node,
-                     bool& any_swap);
-
 };
 
 PLUMED_REGISTER_ACTION(ASM, "ASM")
@@ -343,10 +312,6 @@ void ASM::registerKeywords(Keywords& keys) {
   keys.add("compulsory", "FORCE_KAPPA",    "1000",   "K-adaptation drift term");
   keys.add("compulsory", "MAV_DAMP",       "1e-3",   "EMA damping for metric tensor");
 
-  // Replica exchange
-  keys.add("compulsory", "REX_PERIOD",     "0",
-           "attempt internal bias-exchange replica exchange every N steps; 0 disables");
-
   // Flags. Sander uses YES/NO namelist values; mirrored as string-valued
   // keywords (PLUMED's addFlag requires default=false).
   keys.add("compulsory", "STRING_MOVE",    "YES",
@@ -396,7 +361,9 @@ ASM::ASM(const ActionOptions& ao):
   if(nnodes < 2) {
     error("ASM requires at least 2 replicas (string nodes); got " + std::to_string(nnodes));
   }
-  setNodeIdentity(my_node);
+  node        = my_node;
+  is_terminal = (node == 0 || node + 1 == nnodes);
+  is_server   = (node == 0);
 
   // ---- input CVs -------------------------------------------------------
   ncv = getNumberOfArguments();
@@ -462,9 +429,6 @@ ASM::ASM(const ActionOptions& ao):
   position_gamma = position_gamma_user * gamma_unit_scale;
   force_gamma    = force_gamma_user    * gamma_unit_scale;
 
-  // ---- replica exchange ----------------------------------------------
-  parse("REX_PERIOD", REX_period);
-
   // ---- flags (parsed as YES/NO strings) ------------------------------
   auto parseYesNo = [&](const char* key, bool& dst) {
     std::string s; parse(key, s);
@@ -494,8 +458,6 @@ ASM::ASM(const ActionOptions& ao):
 
   // ---- buffers --------------------------------------------------------
   outputForces.assign(ncv, 0.0);
-  node_to_rank.resize(nnodes);
-  for(unsigned i=0; i<nnodes; ++i) node_to_rank[i] = i;
   nodes.resize(nnodes);
   for(auto& nd : nodes) {
     nd.cv  .assign(ncv,   0.0);
@@ -543,8 +505,6 @@ ASM::ASM(const ActionOptions& ao):
   if(getRestart()) {
     log.printf("    restart from: %s\n", restart_filename.c_str());
   }
-  log.printf("    REX_period=%u%s\n",
-             REX_period, REX_period == 0 ? " (disabled)" : "");
   log.printf("    gamma=%g, position_gamma=%g, force_gamma=%g, force_kappa=%g, Mav_damp=%g\n",
              gamma_user, position_gamma_user, force_gamma_user, force_kappa, Mav_damp);
   log.printf("    gamma unit scale=%g (energy=%s, length=%s, time=%s)\n",
@@ -634,28 +594,22 @@ struct PackerIn {
 };
 }  // namespace
 
-void ASM::nodeAwareAllgather(const std::vector<double>&        send,
-                             std::vector<std::vector<double>>& recv_by_node) const {
-  const unsigned pn = send.size();
-  std::vector<double> recvbuf(pn * nnodes);
+void ASM::allgatherByNode(const std::vector<double>& send,
+                          std::vector<double>& recv) const {
+  // Plain Allgather over multi_sim_comm + Bcast within comm. With one node
+  // per replica and node == multi_sim_comm.Get_rank(), the recv segments are
+  // already in node order — caller unpacks recv[n*stride..(n+1)*stride] for
+  // node n.
+  recv.assign(send.size() * nnodes, 0.0);
   if(comm.Get_rank() == 0) {
-    plumed.multi_sim_comm.Allgather(send, recvbuf);
+    plumed.multi_sim_comm.Allgather(send, recv);
   }
-  comm.Bcast(recvbuf, 0);
-  // node_to_rank[i] = rank that owns node i, so rank r owns rank_to_node[r].
-  std::vector<unsigned> rank_to_node(nnodes);
-  for(unsigned i=0; i<nnodes; ++i) rank_to_node[node_to_rank[i]] = i;
-  recv_by_node.assign(nnodes, std::vector<double>(pn));
-  for(unsigned r=0; r<nnodes; ++r) {
-    const unsigned n = rank_to_node[r];
-    std::copy(recvbuf.begin()+r*pn, recvbuf.begin()+(r+1)*pn,
-              recv_by_node[n].begin());
-  }
+  comm.Bcast(recv, 0);
 }
 
 void ASM::gatherStringAcrossReplicas() {
-  // K_l travels in the same pack as cv/Mav/pos so the cluster-wide remap
-  // is atomic against any state read between two reparam-style gathers.
+  // K_l travels in the same pack as cv/Mav/pos so any reader sees a
+  // self-consistent (cv, Mav, pos, K_l) tuple per node.
   std::vector<double> send;
   send.reserve(ncv + ncv*ncv + 2u);
   PackerOut po(send);
@@ -664,11 +618,14 @@ void ASM::gatherStringAcrossReplicas() {
   po.push(nodes[node].pos);
   po.push(nodes[node].K_l);
 
-  std::vector<std::vector<double>> by_node;
-  nodeAwareAllgather(send, by_node);
+  std::vector<double> recv;
+  allgatherByNode(send, recv);
 
+  const std::size_t stride = send.size();
+  std::vector<double> slice(stride);
   for(unsigned n=0; n<nnodes; ++n) {
-    PackerIn pi(by_node[n]);
+    std::copy(recv.begin()+n*stride, recv.begin()+(n+1)*stride, slice.begin());
+    PackerIn pi(slice);
     pi.pop(nodes[n].cv);
     pi.pop(nodes[n].Mav.getVector());
     pi.pop(nodes[n].pos);
@@ -677,30 +634,16 @@ void ASM::gatherStringAcrossReplicas() {
   for(unsigned i=0; i<nnodes; ++i) invertOrFail(nodes[i].Mav, nodes[i].Minv);
 }
 
-void ASM::gatherBAcrossReplicas() {
-  // Each replica owns one node's B (computed in updateBLocal); broadcast so
-  // biasEnergyAt(i,.) works for every i during attemptReplicaExchange.
-  // Without this the four-energy probe sees B[i]=0 for every node not owned
-  // by rank 0 of multi_sim_comm and effectively always-accepts those swaps.
-  std::vector<std::vector<double>> by_node;
-  nodeAwareAllgather(nodes[node].B.getVector(), by_node);
-  for(unsigned n=0; n<nnodes; ++n) {
-    auto& Bv = nodes[n].B.getVector();
-    Bv = by_node[n];
-  }
-}
-
 void ASM::gatherMavMeanInverted(Matrix<double>& Mtmpinv) {
-  // Sum each replica's nodes[node].Mav across multi_sim_comm, divide by nnodes,
-  // then invert. The summation is over all node slots so the rank-vs-node
-  // remap is irrelevant, but routing through nodeAwareAllgather keeps the
-  // intra-replica Bcast and rank-0 plumbing in one place.
-  std::vector<std::vector<double>> by_node;
-  nodeAwareAllgather(nodes[node].Mav.getVector(), by_node);
+  // Sum each replica's nodes[node].Mav across multi_sim_comm, divide by
+  // nnodes, then invert. The order of summands does not matter.
+  std::vector<double> recv;
+  allgatherByNode(nodes[node].Mav.getVector(), recv);
   Matrix<double> Mtmp(ncv, ncv);
   auto& Mv = Mtmp.getVector();
+  const std::size_t stride = ncv*ncv;
   for(unsigned i=0; i<nnodes; ++i) {
-    for(unsigned k=0; k<ncv*ncv; ++k) Mv[k] += by_node[i][k];
+    for(unsigned k=0; k<stride; ++k) Mv[k] += recv[i*stride + k];
   }
   Mtmp *= (1.0 / double(nnodes));
   Mtmpinv.resize(ncv, ncv);
@@ -992,16 +935,19 @@ void ASM::gatherAccumulatorsByNode(
   po.push(mean_dx);
   po.push(mean_sigma2);
 
-  std::vector<std::vector<double>> by_node;
-  nodeAwareAllgather(send, by_node);
+  std::vector<double> recv;
+  allgatherByNode(send, recv);
 
   dz_full  .assign(nnodes, std::vector<double>(ncv, 0.0));
   dpos_full.assign(nnodes, 0.0);
   dK_full  .assign(nnodes, 0.0);
   mdx_full .assign(nnodes, 0.0);
   ms2_full .assign(nnodes, 0.0);
+  const std::size_t stride = send.size();
+  std::vector<double> slice(stride);
   for(unsigned n=0; n<nnodes; ++n) {
-    PackerIn pi(by_node[n]);
+    std::copy(recv.begin()+n*stride, recv.begin()+(n+1)*stride, slice.begin());
+    PackerIn pi(slice);
     pi.pop(dz_full[n]);
     pi.pop(dpos_full[n]);
     pi.pop(dK_full[n]);
@@ -1044,13 +990,6 @@ void ASM::writeCheckpoint(long local_step) {
     for(double v : row) { out.width(24); out << v; }
     out << '\n';
   };
-
-  // Rank -> node mapping at checkpoint time.
-  out << "rank_to_node\n";
-  std::vector<unsigned> rank_to_node(nnodes);
-  for(unsigned i=0; i<nnodes; ++i) rank_to_node[node_to_rank[i]] = i;
-  for(unsigned r=0; r<nnodes; ++r) { out.width(8); out << rank_to_node[r]; }
-  out << '\n';
 
   out << "string\n";
   for(unsigned i=0; i<nnodes; ++i) emit_row(nodes[i].cv);
@@ -1110,9 +1049,6 @@ void ASM::readCheckpoint() {
   std::vector<std::vector<double>> dz_full(nnodes, std::vector<double>(ncv, 0.0));
   std::vector<double> dpos_full(nnodes, 0.0), dK_full(nnodes, 0.0);
   std::vector<double> mdx_full (nnodes, 0.0), ms2_full(nnodes, 0.0);
-  // Initialise to nnodes (an out-of-range sentinel) so the validation
-  // below catches a missing or partial rank_to_node section.
-  std::vector<unsigned> rank_to_node_ck(nnodes, nnodes);
 
   std::string tag;
   long saved_local_step = 0;
@@ -1137,7 +1073,6 @@ void ASM::readCheckpoint() {
     {"nnodes",      [&]{ in >> ck_nnodes;        }},
     {"ncv",         [&]{ in >> ck_ncv;           }},
     {"K_d",         [&]{ in >> K_d;             }},
-    {"rank_to_node",read_1d(rank_to_node_ck, "rank_to_node")},
     {"string",      read_2d(path_tmp, "string")},
     {"Mav",         read_2d(Mav_tmp,  "Mav")},
     {"pos",         read_1d(pos_tmp,  "pos")},
@@ -1170,15 +1105,6 @@ void ASM::readCheckpoint() {
           + ", expected " + std::to_string(nnodes) + "/"
           + std::to_string(ncv));
   }
-  // Validate rank_to_node is a permutation of [0, nnodes).
-  std::vector<unsigned> seen(nnodes, 0);
-  for(unsigned r=0; r<nnodes; ++r) {
-    const unsigned n = rank_to_node_ck[r];
-    if(n >= nnodes || ++seen[n] > 1) {
-      error("ASM checkpoint " + fname + ": rank_to_node is not a valid "
-            "permutation of [0," + std::to_string(nnodes) + ")");
-    }
-  }
 
   // Move the parsed cluster-wide arrays into the node-of-arrays layout.
   for(unsigned i=0; i<nnodes; ++i) {
@@ -1187,12 +1113,6 @@ void ASM::readCheckpoint() {
     nodes[i].pos = pos_tmp[i];
     nodes[i].K_l = K_l_tmp[i];
   }
-
-  // Restore this rank's node identity from the checkpoint, then pick
-  // accumulator slots by node
-  const unsigned my_msc_rank = node;
-  setNodeIdentity(rank_to_node_ck[my_msc_rank]);
-  for(unsigned r=0; r<nnodes; ++r) node_to_rank[rank_to_node_ck[r]] = r;
 
   // Pick this rank's accumulator slot.
   dz          = dz_full [node];
@@ -1208,142 +1128,6 @@ void ASM::readCheckpoint() {
   phase = Phase::Restarted;        // skip cold-start metric/string init in calculate()
   log.printf("  ASM RESTART: resumed at local_step=%ld from %s\n",
              saved_local_step, fname.c_str());
-}
-
-double ASM::biasEnergyAt(unsigned node_idx,
-                         const std::vector<double>& cv_at) const {
-  // 0.5 * (cv_at - nodes[node_idx].cv)^T nodes[node_idx].B (cv_at - nodes[node_idx].cv)
-  std::vector<double> dCV(ncv);
-  for(unsigned k=0; k<ncv; ++k) {
-    dCV[k] = getPntrToArgument(k)->difference(nodes[node_idx].cv[k], cv_at[k]);
-  }
-  return 0.5 * dotProductM(dCV, dCV, nodes[node_idx].B);
-}
-
-// ----- replica exchange ---------------------------------------------------
-
-void ASM::applyRexSwaps(const std::vector<int>& accept,
-                        const std::vector<std::vector<double>>& dz_by_node,
-                        const std::vector<double>& dpos_by_node,
-                        const std::vector<double>& dK_by_node,
-                        const std::vector<double>& mdx_by_node,
-                        const std::vector<double>& ms2_by_node,
-                        bool& any_swap) {
-  // node_to_rank[] indexes the multi_sim_comm rank that currently owns each
-  // node. After every accepted swap the mapping is mirrored on every rank.
-  any_swap = false;
-  const unsigned my_msc_rank = plumed.multi_sim_comm.Get_rank();
-  for(unsigned i=0; i+1<nnodes; ++i) {
-    if(!accept[i]) continue;
-    any_swap = true;
-    const bool i_am_lower = (my_msc_rank == node_to_rank[i]);
-    const bool i_am_upper = (my_msc_rank == node_to_rank[i+1]);
-    if(i_am_lower) {
-      for(unsigned k=0; k<ncv; ++k) dz[k] = dz_by_node[i+1][k];
-      dpos         = dpos_by_node[i+1];
-      dK           = dK_by_node[i+1];
-      mean_dx      = mdx_by_node[i+1];
-      mean_sigma2  = ms2_by_node[i+1];
-      node         = i+1;
-    } else if(i_am_upper) {
-      for(unsigned k=0; k<ncv; ++k) dz[k] = dz_by_node[i][k];
-      dpos         = dpos_by_node[i];
-      dK           = dK_by_node[i];
-      mean_dx      = mdx_by_node[i];
-      mean_sigma2  = ms2_by_node[i];
-      node         = i;
-    }
-    // Update the global mapping the same way on every rank.
-    std::swap(node_to_rank[i], node_to_rank[i+1]);
-  }
-}
-
-void ASM::attemptReplicaExchange(long local_step) {
-  if(REX_period == 0 || nnodes < 2) return;
-
-  if(!rex_rng_seeded) {
-    // Seed deterministically off rank 0 only; we Bcast all decisions, so
-    // ranks > 0 never need their RNG state.
-    rex_rng.setSeed(- (long)(plumed.multi_sim_comm.Get_rank())
-                    - REX_RNG_SEED_OFFSET - long(getStep()));
-    rex_rng_seeded = true;
-  }
-
-  const unsigned old_node = node;
-
-  // ---- Allgather per-rank packet (cv + dz + scalar accumulators) ------
-  std::vector<double> send;
-  send.reserve(2u*ncv + 4u);
-  std::vector<double> cv_local(ncv);
-  for(unsigned k=0; k<ncv; ++k) cv_local[k] = getArgument(k);
-  PackerOut po(send);
-  po.push(cv_local);
-  po.push(dz);
-  po.push(dpos);
-  po.push(dK);
-  po.push(mean_dx);
-  po.push(mean_sigma2);
-
-  std::vector<std::vector<double>> by_node;
-  nodeAwareAllgather(send, by_node);
-
-  std::vector<std::vector<double>> cv_by_node(nnodes, std::vector<double>(ncv));
-  std::vector<std::vector<double>> dz_by_node(nnodes, std::vector<double>(ncv));
-  std::vector<double> dpos_by_node(nnodes), dK_by_node(nnodes);
-  std::vector<double> mdx_by_node(nnodes),  ms2_by_node(nnodes);
-  for(unsigned n=0; n<nnodes; ++n) {
-    PackerIn pi(by_node[n]);
-    pi.pop(cv_by_node[n]);
-    pi.pop(dz_by_node[n]);
-    pi.pop(dpos_by_node[n]);
-    pi.pop(dK_by_node[n]);
-    pi.pop(mdx_by_node[n]);
-    pi.pop(ms2_by_node[n]);
-  }
-
-  // ---- Decide acceptance for alternating adjacent pairs ----------------
-  // Only rank 0 of multi_sim_comm rolls; broadcast the decisions so every
-  // rank reaches the same conclusion without RNG-sync gymnastics.
-  std::vector<int> accept(nnodes, 0);          // accept[i] => pair (i, i+1)
-  if(comm.Get_rank() == 0 && plumed.multi_sim_comm.Get_rank() == 0) {
-    const long iter = local_step / long(REX_period);
-    // Lower-partner index alternates: iter odd -> (0,1),(2,3),... ;
-    // iter even -> (1,2),(3,4),...
-    const unsigned parity = unsigned(1 - (iter & 1));
-    for(unsigned i=parity; i+1<nnodes; i+=2) {
-      const double Eii   = biasEnergyAt(i,   cv_by_node[i]);
-      const double Ejj   = biasEnergyAt(i+1, cv_by_node[i+1]);
-      const double Eij   = biasEnergyAt(i,   cv_by_node[i+1]);
-      const double Eji   = biasEnergyAt(i+1, cv_by_node[i]);
-      const double dE    = Eij + Eji - Eii - Ejj;
-      const double prob  = (dE > 0.0) ? std::exp(-dE / RT) : 1.0;
-      const double rnd   = rex_rng.RandU01();
-      if(prob >= rnd) accept[i] = 1;
-    }
-  }
-  if(comm.Get_rank() == 0) plumed.multi_sim_comm.Bcast(accept, 0);
-  comm.Bcast(accept, 0);
-
-  // ---- Apply accepted swaps -------------------------------------------
-  bool any_swap = false;
-  applyRexSwaps(accept, dz_by_node, dpos_by_node, dK_by_node,
-                mdx_by_node, ms2_by_node, any_swap);
-
-  // Refresh nodes[node].B / .n / .Minv for the new node on every rank,
-  // even those that weren't part of a swap, because reparametrizeLinear is a
-  // collective (Allgather) call — partial participation would hang MPI. Skip
-  // entirely if no swap happened anywhere.
-  if(any_swap) {
-    setNodeIdentity(node);
-    reparametrizeLinear(/*is_first_call=*/false);
-  }
-
-  // Re-route per-step .dat output to the current node's file when this rank
-  // actually moved. Reopening the same file in append mode would be a no-op.
-  if(node != old_node) {
-    if(dat_stream.isOpen()) dat_stream.close();
-    openOutputFiles();
-  }
 }
 
 double ASM::scaleDpos(double x) const {
@@ -1449,7 +1233,6 @@ void ASM::reparametrizeLinear(bool is_first_call) {
   splineTangentLocal();         // override with spline derivative if available
   normaliseTangentLocal();
   updateBLocal();
-  gatherBAcrossReplicas();
   toBoxLocalNode();
 }
 
@@ -1458,8 +1241,8 @@ void ASM::update() {
   const long local_step = getLocalStep();
 
   // local_step > 0 excludes a phantom local_step=0 production tick that
-  // would otherwise fire string motion / REX / accumulators before any
-  // real production step has run.
+  // would otherwise fire string motion or accumulators before any real
+  // production step has run.
   if(string_move && local_step > 0 && local_step >= start_step
      && long(local_step) % long(string_move_period) == 0) {
 
@@ -1476,21 +1259,13 @@ void ASM::update() {
     }
     nodes[node].K_l += dK * inv_smp / force_gamma;
 
-    // No standalone K_l gather: reparametrizeLinear() below begins with a
-    // node-aware gatherStringAcrossReplicas() that packs K_l with everything
-    // else, so a rank-indexed K_l-only allgather would re-introduce the
-    // post-REX rank≠node bug.
+    // K_l travels with cv/Mav/pos in the next gatherStringAcrossReplicas()
+    // packet — no standalone K_l-only allgather.
     std::fill(dz.begin(), dz.end(), 0.0);
     dpos = 0.0;
     dK   = 0.0;
 
     reparametrizeLinear(/*is_first_call=*/false);
-  }
-
-  // --- internal replica exchange ---
-  if(REX_period > 0 && local_step > 0 && local_step >= start_step
-     && local_step % long(REX_period) == 0) {
-    attemptReplicaExchange(local_step);
   }
 
   // --- per-output_period snapshots & param logs (server only) ---
@@ -1624,6 +1399,12 @@ void ASM::calculate() {
   }
   setBias(force_scale * ene);
   val_force2->set(totf2);
+
+  // GREX-driven exchange evaluations call calculate() with the partner's
+  // positions to read the swapped bias. We must publish the bias above but
+  // mustn't pollute Mav, the tangent, or the dz/dpos/dK accumulators with
+  // the swapped CVs.
+  if(getExchangeStep()) return;
 
   // 3. EMA-update Mav and refresh Minv.
   if(string_move && !read_M) {

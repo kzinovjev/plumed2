@@ -1,5 +1,0 @@
-type=driver
-plumed_modules=asm
-mpiprocs=3
-arg="--multi 3 --plumed plumed.dat --ixyz trajectory.xyz --mc mc.dat"
-extra_files="../../trajectories/trajectory.xyz"
