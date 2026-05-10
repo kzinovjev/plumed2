@@ -48,6 +48,173 @@
 namespace PLMD {
 namespace asm_module {
 
+//+PLUMEDOC BIAS ASM
+/*
+Adaptive String Method: locate a minimum free-energy path in arbitrary CV space.
+
+The Adaptive String Method, searches a path between two states of a system as a
+discretised string of $N$ nodes
+$\{\mathbf{z}_i\}_{i=0}^{N-1}$ in a space of $n$ collective variables
+$\boldsymbol{\xi}=(\xi_1,\dots,\xi_n)$. Every replica of a multi-replica
+simulation owns one node and is restrained to it by a quadratic potential
+
+$$
+V_i(\mathbf{r}) = \frac{\eta(t)}{2}\,
+\Delta\boldsymbol{\xi}^\top \mathbf{B}_i \,\Delta\boldsymbol{\xi},\qquad
+\Delta\boldsymbol{\xi} = \boldsymbol{\xi}(\mathbf{r}) - \mathbf{z}_i,
+$$
+
+where $\eta(t)$ is a ramp that grows linearly from 0 to 1 during the first
+`PREPARATION_STEPS` MD steps and equals 1 thereafter. The matrix
+$\mathbf{B}_i$ blends a longitudinal spring $K_l$ along the local path
+tangent $\mathbf{n}_i$ and an orthogonal spring $K_d$ in the perpendicular
+hyperplane,
+
+$$
+\mathbf{B}_i = (K_l-K_d)\,(\mathbf{M}_i^{-1}\mathbf{n}_i)
+                                  (\mathbf{M}_i^{-1}\mathbf{n}_i)^\top
+            + K_d\,\mathbf{M}_i^{-1},
+$$
+
+with $\mathbf{M}_i$ the mass-weighted CV-space metric tensor evaluated at
+node $i$,
+
+$$
+M_{i,jk}(\mathbf{r}) =
+\langle
+\sum_a \frac{1}{m_a}\,
+\frac{\partial \xi_j}{\partial \mathbf{r}_a}\cdot
+\frac{\partial \xi_k}{\partial \mathbf{r}_a}
+\rangle_i.
+$$
+
+$\mathbf{M}_i$ is updated at every step by an exponential moving average with
+damping `MAV_DAMP`.
+
+Every `STRING_MOVE_PERIOD` steps each node moves with the average drift of
+its replica away from $\mathbf{z}_i$. The string is then unwrapped over
+periodic CVs, smoothed by a least-squares cubic spline, and nodes are
+repositioned to provide uniform sampling along the path, with optimal positions
+and the force constants being adapted dynamically.
+The reparametrisation absorbs any motion along the path tangent, so only the
+orthogonal component effectively deforms the path. The friction coefficients
+`GAMMA`, `POSITION_GAMMA` and `FORCE_GAMMA` set the time scales of node
+motion, node-position evolution along the path and $K_l$ adaptation
+respectively (in inverse host time units; the action rescales them internally
+to keep the integrator step `var += drift / friction * dt` dimensionally
+consistent in any unit system).
+
+If initial `FORCE_CONSTANT_L` it is automatically chosen at the first production
+step to provide uniform sampling assuming flat free energy profile .
+`FORCE_CONSTANT_D` defaults to $K_l/2$. The initial guess for the path should be
+supplied through `GUESS_FILE`; otherwise the current $\boldsymbol{\xi}$ value of
+each replica is taken as the starting node coordinate.
+
+## Replica setup
+
+The action requires `--multi N` with $N\ge 2$. Each MPI replica is bound to
+exactly one string node for the duration of the run, with replica rank
+$r$ owning node $r$. Cross-replica synchronisation of the string state and
+of the per-node accumulators is handled internally; users only have to make
+sure every replica sees the same `ASM` directive.
+
+H-REMD is delegated to the MD engine: the engine performs the coordinate
+swap and Metropolis test while the bias Hamiltonian stays fixed per rank.
+
+## Output
+
+Every replica writes the per-step trajectory `{node+1}.dat` (1-based name)
+containing on each line the input CV values. The replica that owns
+node 0 (the "server") additionally writes, every `OUTPUT_PERIOD` MD steps:
+
+- `{step}.string` — the full polyline at that step in the spline-continuous
+  (unwrapped) representation;
+- `node_positions.dat` — the running positions of all nodes along the path
+  (normalised so that the last entry of each row equals 1);
+- `force_constants.dat` — the per-node values of $K_l$;
+- `convergence.dat` — for each previously written snapshot, the average
+  metric-weighted distance between that snapshot and the current string.
+  Useful as a convergence monitor for the path itself.
+
+Snapshots, the parameter logs and the per-step `*.dat` files all share the
+output directory specified by `DIR`. The action additionally produces
+checkpoint files `{step}.ck` every `CHECKPOINT_PERIOD` steps (defaulting to
+`OUTPUT_PERIOD`). Each checkpoint is self-contained — restarting requires
+only the chosen `.ck` file and a matching topology (same number of replicas
+and CVs).
+
+## Examples
+
+A two-CV string driven by two distances, run on four replicas.
+
+```plumed
+#SETTINGS NREPLICAS=4
+d1: DISTANCE ATOMS=1,2
+d2: DISTANCE ATOMS=3,4
+ASM ...
+  ARG=d1,d2
+  ATOMS=1-6
+  DIR=string/
+  PREPARATION_STEPS=1000
+  OUTPUT_PERIOD=500
+  TEMP=300
+  LABEL=asm
+... ASM
+PRINT ARG=asm.bias,asm.force2 FILE=colvar STRIDE=10
+```
+
+Restart of a previous run from the checkpoint written at production step
+1000. The `RESTART_FILE` path is resolved against `DIR` when relative.
+
+```plumed
+#SETTINGS NREPLICAS=4
+RESTART
+d1: DISTANCE ATOMS=1,2
+d2: DISTANCE ATOMS=3,4
+ASM ...
+  ARG=d1,d2
+  ATOMS=1-6
+  DIR=string/
+  OUTPUT_PERIOD=500
+  TEMP=300
+  RESTART_FILE=1000.ck
+  LABEL=asm
+... ASM
+```
+
+Starting from a user-provided initial path. `GUESS_FILE` follows the layout
+
+```
+ninit
+g_1_1  g_1_2  ...  g_1_n
+g_2_1  g_2_2  ...  g_2_n
+...
+g_ninit_1  ...     g_ninit_n
+```
+
+with `ninit` the number of guess points and `n` the number of CVs. When
+`ninit` differs from the number of replicas the path is resampled at
+equally-spaced arc lengths in a single consistent metric.
+
+```plumed
+#SETTINGS NREPLICAS=4 INPUTFILES=extras/asm_guess.dat
+d1: DISTANCE ATOMS=1,2
+d2: DISTANCE ATOMS=3,4
+ASM ...
+  ARG=d1,d2
+  ATOMS=1-6
+  DIR=string/
+  GUESS_FILE=extras/asm_guess.dat
+  PREPARATION_STEPS=1000
+  OUTPUT_PERIOD=500
+  TEMP=300
+  LABEL=asm
+... ASM
+```
+
+*/
+//+ENDPLUMEDOC
+
 class ASM :
   public ActionAtomistic,
   public ActionPilot,
@@ -284,7 +451,7 @@ void ASM::registerKeywords(Keywords& keys) {
            "steps over which the harmonic force ramps from 0 to 1");
   keys.add("optional", "START_STEP",
            "production step at which string evolution begins (default = 0, "
-           "i.e., immediately after preparation)");
+           "immediately after preparation)");
   keys.add("compulsory", "STRING_MOVE_PERIOD", "1",
            "apply accumulated dz/dpos/dK every N steps");
 

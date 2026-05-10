@@ -54,6 +54,76 @@
 namespace PLMD {
 namespace function {
 
+//+PLUMEDOC FUNCTION FUNCPATHASM
+/*
+Path collective variables on a path produced by the adaptive string method.
+
+This action consumes a finished string of $N$ points
+$\{\mathbf{p}_i\}_{i=0}^{N-1}$ in a space of $n$ collective variables, with
+their cumulative arc lengths $\{\ell_i\}$ and per-point inverse-metric tensors
+$\{\mathbf{M}_i^{-1}\}$, and returns the Branduardi-style progress and
+distance variables
+
+$$
+s = \frac{\sum_i \ell_i\, w_i}{\sum_j w_j},\qquad
+z = -\frac{1}{\lambda}\,\log\!\sum_j w_j,
+$$
+
+where the weights are evaluated from a Mahalanobis distance using the
+per-point metric of the supplied path,
+
+$$
+w_i = \exp\bigl(-\lambda\, d_i\bigr),\qquad
+d_i = \sqrt{(\mathbf{x}-\mathbf{p}_i)^\top\,\mathbf{M}_i^{-1}\,(\mathbf{x}-\mathbf{p}_i)}.
+$$
+
+Compared with [FUNCPATHGENERAL](FUNCPATHGENERAL.md) and
+[FUNCPATHMSD](FUNCPATHMSD.md) the distinguishing feature is the use of a
+different metric tensor at every point of the path. For paths produced by
+[ASM](ASM.md) those metrics are precisely the ones the string method
+estimates on the fly while it converges, so the resulting $(s,z)$ pair
+inherits the parametrisation invariance of the underlying string. Periodicity
+of the input CVs is honoured through `Value::difference`.
+
+The path file is plain text, free-format and whitespace-separated. Its layout
+is
+
+```
+nCV  npoints  lambda
+arc[0]  arc[1]  ...  arc[npoints-1]
+p[0][0]      p[0][1]      ...  p[0][nCV-1]
+p[1][0]      p[1][1]      ...  p[1][nCV-1]
+...
+Minv[0]   (nCV*nCV values)
+Minv[1]
+...
+Minv[npoints-1]
+```
+
+The number of CVs in the file must match the number of `ARG` entries given
+to `FUNCPATHASM`. The action exposes two output components, `.s` and `.z`,
+both computed with analytic derivatives so they can be used as the argument
+of any other PLUMED action that needs forces — for instance a
+[RESTRAINT](RESTRAINT.md) on the progress variable.
+
+## Examples
+
+A two-CV path biased through a soft restraint on the progress variable.
+The `pathCV.def` file contains the path, the per-point arc lengths and the
+per-point inverse metric tensors.
+
+```plumed
+#SETTINGS INPUTFILES=extras/asm_pathCV.def
+t1: TORSION ATOMS=1,2,3,4
+t2: TORSION ATOMS=3,4,5,6
+mypath: FUNCPATHASM ARG=t1,t2 REFERENCE=extras/asm_pathCV.def
+PRINT ARG=mypath.s,mypath.z FILE=colvar
+RESTRAINT ARG=mypath.s AT=0.5 KAPPA=10.0
+```
+
+*/
+//+ENDPLUMEDOC
+
 class FuncPathASM : public Function {
   unsigned ncv;
   unsigned npoints;
