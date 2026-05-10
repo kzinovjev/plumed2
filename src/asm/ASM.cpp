@@ -82,7 +82,6 @@ private:
   double force_scale    = 0.0;
   bool   fix_ends       = true;
   bool   string_move    = true;
-  bool   read_M         = false;
   bool   rescale_forces = true;
   unsigned preparation_steps   = 0;
   unsigned string_move_period  = 1;
@@ -151,7 +150,7 @@ public:
   // Tells PlumedMain::prepareDependencies to call setOption("GRADIENTS"),
   // which propagates to upstream actions (TORSION etc.) so their Value::gradients
   // map gets populated from the per-atom derivatives we read in buildLocalMetric.
-  bool checkNeedsGradients() const override { return !read_M; }
+  bool checkNeedsGradients() const override { return true; }
   void calculateNumericalDerivatives(ActionWithValue* a = nullptr) override {
     plumed_merror("ASM does not support numerical derivatives");
   }
@@ -205,7 +204,6 @@ private:
 
   // initial-guess support
   std::vector<std::vector<double>> guess_string;   // [ninit][ncv], empty if not used
-  std::vector<Matrix<double>>      guess_Minv;     // [ninit] full ncv×ncv, populated only if read_M
   void readGuessFile(const std::string& path);
   void interpolateLinear(const std::vector<std::vector<double>>& src,
                          std::vector<std::vector<double>>&       dst,
@@ -318,8 +316,6 @@ void ASM::registerKeywords(Keywords& keys) {
            "if NO, K and string never change (passive bias)");
   keys.add("compulsory", "FIX_ENDS",       "YES",
            "pin the two terminal nodes during string evolution");
-  keys.add("compulsory", "READ_M",         "NO",
-           "use a fixed Minv from the initial guess; skip metric averaging");
   keys.add("compulsory", "RESCALE_FORCES", "YES",
            "rescale K with string length on each reparametrization");
 
@@ -439,7 +435,6 @@ ASM::ASM(const ActionOptions& ao):
   };
   parseYesNo("STRING_MOVE",    string_move);
   parseYesNo("FIX_ENDS",       fix_ends);
-  parseYesNo("READ_M",         read_M);
   parseYesNo("RESCALE_FORCES", rescale_forces);
 
   // ---- force constants (defer auto-default until first calculate) -----
@@ -512,10 +507,9 @@ ASM::ASM(const ActionOptions& ao):
              U.getEnergyString().c_str(),
              U.getLengthString().c_str(),
              U.getTimeString().c_str());
-  log.printf("    flags: string_move=%s fix_ends=%s read_M=%s rescale_forces=%s\n",
+  log.printf("    flags: string_move=%s fix_ends=%s rescale_forces=%s\n",
              string_move    ? "YES":"NO",
              fix_ends       ? "YES":"NO",
-             read_M         ? "YES":"NO",
              rescale_forces ? "YES":"NO");
   if(getRestart()) {
     readCheckpoint();
@@ -655,8 +649,6 @@ void ASM::readGuessFile(const std::string& path) {
   //   line 1:    ninit (integer)
   //   following: ninit*ncv whitespace-separated doubles — each row is one
   //              point's CV vector.
-  //   if read_M: ninit*ncv*ncv doubles for the per-point Minv — each point
-  //              is a full ncv×ncv symmetric matrix in row-major order.
   std::ifstream in(path);
   if(!in) error("ASM: cannot open GUESS_FILE '" + path + "'");
   unsigned ninit = 0;
@@ -672,20 +664,8 @@ void ASM::readGuessFile(const std::string& path) {
       }
     }
   }
-  if(read_M) {
-    guess_Minv.assign(ninit, Matrix<double>(ncv, ncv));
-    for(unsigned i=0; i<ninit; ++i) {
-      auto& Mv = guess_Minv[i].getVector();
-      for(unsigned k=0; k<ncv*ncv; ++k) {
-        if(!(in >> Mv[k])) {
-          error("ASM: GUESS_FILE '" + path + "' truncated reading Minv "
-                "for point " + std::to_string(i));
-        }
-      }
-    }
-  }
-  log.printf("    read initial-guess string with %u points from %s%s\n",
-             ninit, path.c_str(), read_M ? " (incl. Minv)" : "");
+  log.printf("    read initial-guess string with %u points from %s\n",
+             ninit, path.c_str());
 }
 
 void ASM::interpolateLinear(const std::vector<std::vector<double>>& src,
@@ -1291,24 +1271,9 @@ void ASM::initOnFirstCall(bool from_restart) {
 
   // 1. Initial metric sample.
   //    On restart we already have a saved Mav from the checkpoint and
-  //    must not overwrite it with a one-step sample. With read_M and a
-  //    guess file holding Minv we seed Mav from the file's per-node Minv.
-  if(read_M && !guess_Minv.empty() && !from_restart) {
-    // Pick the guess-Minv slot matching this node — interpolate when the
-    // guess has a different point count, otherwise direct copy.
-    if(guess_Minv.size() == nnodes) {
-      nodes[node].Minv = guess_Minv[node];
-    } else {
-      // For the metric, "linear interpolation between Minv tensors" is a
-      // crude but standard fallback — picks the nearest guess point.
-      const unsigned src_idx = (node * (guess_Minv.size()-1)) / (nnodes-1);
-      nodes[node].Minv = guess_Minv[src_idx];
-    }
-    invertOrFail(nodes[node].Minv, nodes[node].Mav);
-  } else {
-    if(!read_M && !from_restart) buildLocalMetric(nodes[node].Mav);
-    invertOrFail(nodes[node].Mav, nodes[node].Minv);
-  }
+  //    must not overwrite it with a one-step sample.
+  if(!from_restart) buildLocalMetric(nodes[node].Mav);
+  invertOrFail(nodes[node].Mav, nodes[node].Minv);
 
   // 2. Initial string positions:
   //    - on restart, nodes[node].cv was loaded from the checkpoint.
@@ -1381,7 +1346,7 @@ void ASM::calculate() {
 
   // 1. Local metric sample (this step).
   Matrix<double> M_now;
-  if(string_move && !read_M) buildLocalMetric(M_now);
+  if(string_move) buildLocalMetric(M_now);
 
   // 2. Apply harmonic force on the input ARGs:
   //      F_i = -force_scale * (nodes[node].B · diff(CV - string[node]))_i
@@ -1407,7 +1372,7 @@ void ASM::calculate() {
   if(getExchangeStep()) return;
 
   // 3. EMA-update Mav and refresh Minv.
-  if(string_move && !read_M) {
+  if(string_move) {
     auto& Mav_node = nodes[node].Mav;
     const double a = 1.0 - Mav_damp, b = Mav_damp;
     for(unsigned i=0; i<ncv; ++i)
