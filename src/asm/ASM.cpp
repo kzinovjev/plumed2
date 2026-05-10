@@ -231,7 +231,7 @@ private:
   // because node identity is already encoded in the file path.
   void openAppendFile(OFile& f, const std::string& path);
   void openOutputFiles();
-  void writeDat(const std::vector<double>& dz_tmp);  // {node}.dat — per-step append
+  void writeDat();                  // {node}.dat — per-step append
   void writeSnapshot(long step);    // {step}.string — every output_period
   void writeParams();               // node_positions.dat, force_constants.dat
   void writeConvergence(long current_step);  // convergence.dat — distances of all snapshots up to current_step
@@ -802,13 +802,9 @@ void ASM::openOutputFiles() {
   openAppendFile(dat_stream, dir + std::to_string(node + 1) + ".dat");
 }
 
-void ASM::writeDat(const std::vector<double>& dz_tmp) {
-  // Per-step trajectory: CVs, this node's string position, dz_tmp/gamma.
+void ASM::writeDat() {
   if(!dat_stream.isOpen()) return;
   for(unsigned k=0; k<ncv; ++k) dat_stream.printf("%15.5e", getArgument(k));
-  for(unsigned k=0; k<ncv; ++k) dat_stream.printf("%15.5e", nodes[node].cv[k]);
-  for(unsigned k=0; k<ncv; ++k)
-    dat_stream.printf("%15.5e", gamma > 0.0 ? dz_tmp[k] / gamma : 0.0);
   dat_stream.printf("\n");
   dat_stream.flush();
 }
@@ -1393,8 +1389,7 @@ void ASM::calculate() {
   force_scale = 1.0;
   if(local_step < start_step) {
     // Production but not yet evolving — full force, .dat row, no accumulation.
-    const std::vector<double> dz_zero(ncv, 0.0);
-    writeDat(dz_zero);
+    writeDat();
     return;
   }
 
@@ -1438,7 +1433,7 @@ void ASM::calculate() {
     dpos += dpos_tmp;
     dK   += dK_tmp;
   }
-  writeDat(dz_tmp);
+  writeDat();
 }
 
 void ASM::apply() {
